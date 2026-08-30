@@ -2,6 +2,23 @@
 
 const $ = id => document.getElementById(id)
 
+let video = $('player') // video element currently on stage
+let standby = $('player-b') // hidden element the next clip preloads into
+
+// put the preloaded standby element on stage and retire the current one
+function swapPlayers() {
+  const old = video
+  video = standby
+  standby = old
+  old.onended = old.onerror = old.onclick = old.onloadeddata = null
+  old.pause()
+  old.removeAttribute('src')
+  old.hidden = true
+  video.onloadeddata = null
+  video.hidden = false
+  $('frame').hidden = true
+}
+
 // server turn token, guards against acting on stale choices
 // persisted per tab so a refresh doesn't count as a missed turn and replay the last clip
 let currentToken = 0
@@ -59,7 +76,7 @@ function startTimer(label) {
 function showFrame(url) {
   $('frame').src = url
   $('frame').hidden = false
-  $('player').hidden = true
+  video.hidden = true
 }
 
 // render the choice buttons for the current turn
@@ -73,6 +90,7 @@ function renderChoices(labels) {
     box.appendChild(btn)
   })
   if ($('dev').open) loadDev() // keep an open dev panel in sync with the new turn
+  startIdleLoop() // idle animation from the moment the options are up
 }
 
 let devGen = 0 // bumped to invalidate stale dev panel fetches
@@ -91,6 +109,7 @@ async function loadDev(force = false) {
     const parts = []
     if (d.scenePrompt) parts.push(`[opening frame prompt]\n${d.scenePrompt}`)
     if (d.clipPrompt) parts.push(`[current clip prompt (${d.clipDuration}s)]\n${d.clipPrompt}`)
+    if (d.loopPrompt) parts.push(`[idle loop prompt]\n${d.loopPrompt}`)
     d.choices.forEach((c, i) => parts.push(`[option ${i + 1}: ${c.label} (${c.duration}s)]\n${c.prompt}`))
     el.textContent = parts.join('\n\n')
     devToken = d.token // cache under the server's token, another tab may have advanced the game
@@ -106,13 +125,35 @@ function setChoicesDisabled(disabled) {
 
 // play a clip and show the given choices when it ends
 async function playClip(clipUrl, frameUrl, choices) {
+  const ui = uiGen
+  if (loop && !loop.playing) loop.stop() // a loop that never made it on stage is stale, free its standby element
+  new Image().src = frameUrl // warm the browser cache off-screen, fallbacks may need the outcome frame instantly
+  // preload the clip into the standby element so the swap onto the stage has no load gap
+  standby.muted = false // idle loops play muted, clips carry the audio
+  standby.src = clipUrl
+  const loaded = new Promise(r => { standby.onloadeddata = () => r(true); standby.onerror = () => r(false) })
+  if (loop && !loop.stopped && loop.playing) {
+    // let the current loop cycle end so the cut to the clip lands on the shared keyframe
+    // the cap only rescues stuck playback: a cycle is 5s, so a healthy loop ends well within it
+    await new Promise(r => { loop.handoff = r; setTimeout(r, 15000) })
+    if (ui !== uiGen) return
+  }
+  const ok = await Promise.race([loaded, new Promise(r => setTimeout(() => r(false), 15000))])
+  if (ui !== uiGen) return
+  loop?.stop() // the clip supersedes any idle loop
   const gen = ++playGen
   $('choices').innerHTML = ''
   if ($('dev').open) loadDev() // the turn has advanced server-side, refresh an open dev panel now
-  const video = $('player')
-  video.src = clipUrl
-  video.hidden = false
-  $('frame').hidden = true
+  $('frame').src = frameUrl // keep the hidden img on the latest frozen frame for fallbacks
+  if (!ok) { // preload broke or stalled, degrade to the outcome frame instead of cutting to black
+    standby.removeAttribute('src')
+    setStatus('Clip playback failed, showing its final frame', true)
+    showFrame(frameUrl)
+    renderChoices(choices)
+    return
+  }
+  swapPlayers()
+  const v = video // handlers stick to this element even if the stage swaps again
   // clip won't play, fall back to its last frame so the player still sees the outcome
   const fallback = () => {
     if (gen !== playGen) return // superseded, don't touch the ui
@@ -120,31 +161,95 @@ async function playClip(clipUrl, frameUrl, choices) {
     showFrame(frameUrl)
     renderChoices(choices)
   }
-  video.onended = () => { if (gen === playGen) renderChoices(choices) } // video pauses on its last frame
-  video.onerror = fallback
+  v.onended = () => { if (gen === playGen) renderChoices(choices) } // video pauses on its last frame
+  v.onerror = fallback
   try {
-    await video.play()
+    await v.play()
   } catch (err) {
     if (gen !== playGen) return
     if (err.name !== 'NotAllowedError') return fallback()
     // autoplay blocked, ask for a click
     setStatus('Click the video to play')
-    video.onclick = () => {
-      video.onclick = null
+    v.onclick = () => {
+      v.onclick = null
       setStatus('')
-      video.play().catch(fallback)
+      v.play().catch(fallback)
     }
   }
 }
 
+let loop = null // idle loop controller for the current turn's frame
+
+// poll for the current turn's idle loop and play it on repeat until a clip takes over
+// plays from the moment it's ready: while the player picks and through the render wait
+function startIdleLoop() {
+  if (loop && !loop.stopped && loop.token === currentToken) return // already running for this turn
+  loop?.stop()
+  const gen = uiGen
+  const self = { token: currentToken, stopped: false, playing: false, handoff: null, timer: null }
+  loop = self
+  // stop polling and playback, whatever is on stage stays as the caller left it
+  self.stop = () => {
+    if (self.stopped) return
+    self.stopped = true
+    clearTimeout(self.timer)
+    if (self.playing) {
+      self.playing = false
+      playGen++ // drop the loop's handlers
+    }
+  }
+  const tick = async () => {
+    try {
+      const state = await (await fetch('/api/state')).json()
+      if (self.stopped || gen !== uiGen) return
+      if (state.token !== self.token) return // the game advanced elsewhere, this loop is obsolete
+      if (state.loopFailed) return // no loop this turn, the frame stands
+      if (state.loopUrl) {
+        const myGen = ++playGen
+        const next = standby // preload off stage, the current picture holds until the loop is decoded
+        // loop broke after taking the stage, fall back to the frozen frame and release any waiting handoff
+        const fail = () => {
+          if (playGen !== myGen) return
+          self.playing = false
+          video.hidden = true
+          $('frame').hidden = false
+          if (self.handoff) self.handoff()
+        }
+        next.muted = true // repetitive loop audio off, also lets autoplay through without a fresh gesture
+        next.src = state.loopUrl
+        next.onerror = () => {} // load failed, whatever's on stage stands
+        next.onloadeddata = () => {
+          if (playGen !== myGen || self.stopped) return
+          swapPlayers() // the decoded loop takes the stage with no load gap
+          self.playing = true
+          const v = video
+          v.onended = () => {
+            if (playGen !== myGen) return
+            if (self.handoff) return self.handoff() // cut to the clip on the shared keyframe
+            v.currentTime = 0 // restart the cycle
+            v.play().catch(fail)
+          }
+          v.onerror = fail
+          v.play().catch(fail) // autoplay refused or broken, the frame stands
+        }
+        return
+      }
+    } catch {} // transient poll failure, just try again
+    if (!self.stopped) self.timer = setTimeout(tick, 3000)
+  }
+  tick() // check immediately, the loop may already be rendered
+}
+
 // stop playback and drop media handlers so nothing fires afterward
 function stopMedia() {
+  if (loop) { loop.stop(); loop = null } // drop the idle loop with everything else
   playGen++ // cancel any pending playback callbacks
-  const video = $('player')
-  video.onended = video.onerror = video.onclick = null
-  video.pause()
-  video.removeAttribute('src')
-  video.hidden = true
+  for (const v of [video, standby]) {
+    v.onended = v.onerror = v.onclick = v.onloadeddata = null
+    v.pause()
+    v.removeAttribute('src')
+    v.hidden = true
+  }
   $('frame').removeAttribute('src')
   $('frame').hidden = true
 }
@@ -237,7 +342,7 @@ async function choose(index, labels) {
   const done = startTimer('Rendering clip...')
   let data
   try {
-    data = await api('/api/choose', { index, token: currentToken })
+    data = await api('/api/choose', { index, token: currentToken }) // the idle loop keeps playing meanwhile
   } catch (err) {
     if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
     // the failure may be ambiguous, recover only if the server actually advanced
@@ -257,7 +362,7 @@ async function choose(index, labels) {
   // the server has advanced, from here on only the new choices may be shown
   setToken(data.token)
   done() // hold the final generation time
-  await playClip(data.clipUrl, data.frameUrl, data.choices)
+  await playClip(data.clipUrl, data.frameUrl, data.choices) // waits out the current loop cycle itself
 }
 
 // end the current game server-side and return to the start screen

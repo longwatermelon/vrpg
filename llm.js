@@ -25,8 +25,9 @@ const RESPONSE_FORMAT = {
             additionalProperties: false,
           },
         },
+        'loop-prompt': { type: 'string' },
       },
-      required: ['choices'],
+      required: ['choices', 'loop-prompt'],
       additionalProperties: false,
     },
   },
@@ -63,14 +64,16 @@ function parseJson(raw) {
   try { return JSON.parse(text) } catch { return null }
 }
 
-// parse and validate the choices json from raw llm output, null if invalid
+// parse and validate the choices json plus idle loop prompt from raw llm output, null if invalid
 function parseChoices(raw) {
-  const choices = parseJson(raw)?.choices
+  const obj = parseJson(raw)
+  const choices = obj?.choices
   if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
       choices.every(c => typeof c.label === 'string' && c.label.trim() &&
                          typeof c.prompt === 'string' && c.prompt.trim() &&
-                         Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15)) {
-    return choices
+                         Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15) &&
+      typeof obj['loop-prompt'] === 'string' && obj['loop-prompt'].trim()) {
+    return { choices, loopPrompt: obj['loop-prompt'] }
   }
   return null
 }
@@ -91,10 +94,10 @@ async function completeJson(messages, format, parse, what) {
   return { raw, out }
 }
 
-// get the next set of choices from the llm, retrying once on bad json
+// get the next set of choices plus idle loop prompt from the llm, retrying once on bad json
 export async function chatChoices(messages) {
   const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, parseChoices, 'choices')
-  return { raw, choices: out }
+  return { raw, choices: out.choices, loopPrompt: out.loopPrompt }
 }
 
 // strict schema for the game setup call: fleshed-out character plus opening frame prompt

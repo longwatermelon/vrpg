@@ -10,7 +10,8 @@ const headers = { Authorization: `Key ${process.env.FAL_API_KEY}`, 'Content-Type
 const shortTimeout = () => AbortSignal.timeout(60 * 1000) // per-request cap so a stalled call can't hang the game
 
 // submit an image-to-video job to fal, duration in seconds, returns the queue handle urls
-export async function submitJob(prompt, imageDataUri, duration) {
+// endImageDataUri optionally pins the last frame, used to force idle loops closed
+export async function submitJob(prompt, imageDataUri, duration, endImageDataUri) {
   const submit = await fetch(VIDEO_ENDPOINT, {
     method: 'POST',
     headers,
@@ -18,6 +19,7 @@ export async function submitJob(prompt, imageDataUri, duration) {
     body: JSON.stringify({
       prompt,
       image_url: imageDataUri,
+      ...(endImageDataUri && { end_image_url: endImageDataUri }),
       duration,
       resolution: '480P',
       prompt_expansion_mode: 'balanced',
@@ -25,6 +27,11 @@ export async function submitJob(prompt, imageDataUri, duration) {
   })
   if (!submit.ok) throw new Error(`fal submit failed: ${submit.status} ${await submit.text()}`)
   return await submit.json()
+}
+
+// best-effort cancel of a queued fal job so an abandoned render stops billing
+export function cancelJob(job) {
+  if (job?.cancel_url) fetch(job.cancel_url, { method: 'PUT', headers, signal: shortTimeout() }).catch(() => {})
 }
 
 // poll a submitted fal job until it completes, then fetch and return the result json

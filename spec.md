@@ -15,6 +15,7 @@ At this point, the player enters the main game loop, which consists of the follo
   * Player clicks on one option; the label of that choice gets inserted into the user message (ie "Eat the sandwich", "Say: \"What are you doing here?\"", etc).
   * Video model renders clip starting from current paused frame.
     - Note: rendered clip must preserve continuity. Start from the last frame of the previous clip. All characters, settings, objects, etc. should stay consistent.
+    - After the clip renders, a 5s idle loop of its last frame is also rendered (from the new turn's top-level `loop-prompt`) and the turn isn't returned until both are done — seamlessness over latency. The loop plays on repeat from the moment the clip ends and the options are up, through the next render wait. When the next clip is ready, the current loop cycle finishes first — the loop ends on its start keyframe, which is also the clip's start keyframe — so the cut is seamless. The loop is best-effort: if its render fails, the static frame stands.
   * Clip plays once rendered, pauses at its last frame. Attach the last frame of that clip to the user message.
 
 So the user message is structured as `Choose option: <option label>\nAttached image is the last frame of where this chosen action left off.` with the frozen frame attached as an image. The LLM reads this and decides what options come next.
@@ -34,11 +35,14 @@ So the user message is structured as `Choose option: <option label>\nAttached im
       "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him. Action: the man in the gray hoodie rises from the table and walks out of the restaurant. The woman looks confused and says <d>[English] Hey, where are you going!?</d>.",
       "duration": 6
     }
-  ]
+  ],
+  "loop-prompt": "A tall young man with short brown hair in a gray hoodie and a young woman sit facing each other at a restaurant table. The camera stays still. They idle in place, breathing softly and glancing around. By the end both have returned exactly to their starting poses."
 }
 ```
 
 Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; nothing is prepended. The `duration` field is the clip length in seconds, chosen by the LLM as an integer 5-15 (5 for a short one-shot action, 7-12 default, 15 for dialogue/fights/explanations) and passed straight to the video model. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
+
+The top-level `loop-prompt` field describes a 5s idle animation of the current frame (the one the choices are offered on): camera roughly still, characters doing subtle believable idle motion, ending back exactly at the start pose so it loops seamlessly. It renders with duration 5 and the current frame as both start keyframe and `end_image_url`, forcing the loop closed. The choose turn only returns once both the main clip and this loop are rendered, so the loop is guaranteed ready when the clip finishes playing. The opening turn's loop is the exception: it renders in the background and pops in when ready, so game start isn't delayed.
 
 ## Models
 

@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chatChoices, startScene } from './llm.js'
-import { submitJob, awaitJob, submitImageJob, awaitImageJob } from './fal.js'
+import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob } from './fal.js'
 import { extractLastFrame } from './media.js'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
@@ -15,7 +15,7 @@ function systemPrompt(character) {
 The player controls one character in the story. Their appearance: ${character}
 
 Each turn you receive the player's chosen action plus an image of the frame where the story currently stands. Respond with ONLY a JSON object (no markdown fences, no commentary) offering 2-3 choices:
-{"choices": [{"label": "...", "prompt": "...", "duration": 8}]}
+{"choices": [{"label": "...", "prompt": "...", "duration": 8}], "loop-prompt": "..."}
 
 "label" is a short action the player's character can take, e.g. "Eat the sandwich" or "Say: \\"What are you doing here?\\"".
 
@@ -23,10 +23,14 @@ Each turn you receive the player's chosen action plus an image of the frame wher
 
 "duration" is the clip length in seconds, an integer from 5 to 15: 5 for a short one-shot action, 7-12 for most actions, 15 for explanations, back-and-forth dialogue, or fights.
 
-Make the story interesting and fun; be creative.
+"loop-prompt" is a prompt for a 5-second idle animation starting from the current frame, shown looping while the player picks an option and while their chosen clip renders. Continue whatever repeatable action the characters are currently doing. For example, if they're walking with a repeatable background (ie, a wall or a crowd or a streetside), keep them walking against that background. If a character is typing, keep them typing. If a character is drinking, keep them drinking. Use natural, loopable actions that don't make it obvious a loop is occurring. You must also consider the loopability of what the characters are doing in the end state for each prompt; make sure the end state is configured so that the characters are doing something that's loopable. For example, if a character is walking into a building and the clip ends around the character opening the door and entering, make sure the end state has the camera perspective viewing the character in an angle such that the background is loopable; maybe a side view as they enter the building, relatively close-up, so that they can continue walking and background elements can continue repeating.
+
+The loop must not perform any of the choices or advance the story. Like "prompt", it must be self-contained.
+
+Make the story interesting and fun; be creative. Keep the story progressing - pace it properly. Not too slow, not too fast.
 
 Example response (player character: a tall young man with short brown hair in a gray hoodie; frame: him at dinner with his girlfriend, a sandwich on her plate - labels may use story knowledge, prompts may not):
-{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie.", "duration": 8}, {"label": "Call the waiter over", "prompt": "The man in the gray hoodie sitting at the table raises his hand, and a middle-aged man in a white apron (currently off-screen) walks into view and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman watching him.", "duration": 6}]}`
+{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie.", "duration": 8}, {"label": "Call the waiter over", "prompt": "The man in the gray hoodie sitting at the table raises his hand, and a middle-aged man in a white apron (currently off-screen) walks into view and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman watching him.", "duration": 6}], "loop-prompt": "A tall young man with short brown hair in a gray hoodie and a young woman sit facing each other at a restaurant table. The camera stays still. They idle in place, breathing softly and glancing around; the woman lightly drums her fingers on the table. By the end both have returned exactly to their starting poses."}`
 }
 
 let session = null // single in-memory session
@@ -36,6 +40,34 @@ let pendingRender = null // finished render awaiting a successful llm turn, avoi
 let pendingStart = null // finished opening frame awaiting a successful llm turn, avoids regenerating on retry
 
 let resetInFlight = null // dedupes overlapping resets and blocks new game ops from overtaking one
+
+let idleLoop = null // this turn's 5s idle loop render, best-effort
+
+// forget the current idle loop, best-effort canceling a still-running render
+function dropIdleLoop() {
+  if (idleLoop && !idleLoop.url && !idleLoop.failed) {
+    idleLoop.aborted = true // tells a submit still in flight to cancel on arrival
+    cancelJob(idleLoop.job)
+  }
+  idleLoop = null
+}
+
+// render a 5s idle loop of the current frame, best-effort, returns a never-rejecting promise
+function startIdleLoopRender(s, tok) {
+  if (idleLoop?.token === tok) return idleLoop.promise // already rendering for this turn
+  dropIdleLoop() // a previous turn's loop still rendering is stale, cancel it
+  const out = path.join(s.dir, `loop-${s.turn}.mp4`)
+  const state = { token: tok, url: null }
+  idleLoop = state
+  state.promise = (async () => {
+    const frameUri = toDataUri(s.frame)
+    state.job = await submitJob(s.loopPrompt, frameUri, 5, frameUri) // same frame as start and end forces a closed loop
+    if (state.aborted) return cancelJob(state.job) // dropped while submitting
+    await awaitJob(state.job, out)
+    state.url = toUrl(out)
+  })().catch(() => { state.failed = true }) // no loop, the static frame stands; keep the entry so nothing resubmits
+  return state.promise
+}
 
 // run fn while holding the busy flag, rejects overlapping requests unless wait is set
 async function exclusive(fn, wait = false) {
@@ -72,8 +104,8 @@ async function nextTurn(s, text, frame) {
       { type: 'image_url', image_url: { url: toDataUri(frame) } },
     ],
   }
-  const { raw, choices } = await chatChoices([...s.messages.map(stripImage), userMsg]) // only the new frame goes out
-  return { msgs: [userMsg, { role: 'assistant', content: raw }], choices }
+  const { raw, choices, loopPrompt } = await chatChoices([...s.messages.map(stripImage), userMsg]) // only the new frame goes out
+  return { msgs: [userMsg, { role: 'assistant', content: raw }], choices, loopPrompt }
 }
 
 // drop the image from an older user message, the text alone carries the history
@@ -83,10 +115,11 @@ function stripImage(msg) {
 }
 
 // commit a finished turn to session s, only called after every step succeeded
-function commitTurn(s, { msgs, choices }, frame, turn) {
+function commitTurn(s, { msgs, choices, loopPrompt }, frame, turn) {
   s.messages = s.messages.map(stripImage) // keep stored history slim, images live on disk
   s.messages.push(...msgs)
   s.choices = choices
+  s.loopPrompt = loopPrompt
   s.frame = frame
   s.turn = turn
   token++
@@ -102,6 +135,8 @@ export function getState() {
     token,
     frameUrl: toUrl(session.frame),
     clipUrl: session.clip ? toUrl(session.clip) : null,
+    loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
+    loopFailed: idleLoop?.token === token ? !!idleLoop.failed : false, // tells the client to stop waiting for one
     choices: session.choices.map(c => c.label),
   }
 }
@@ -115,6 +150,7 @@ export function getDebug() {
     scenePrompt: session.scenePrompt,
     clipPrompt: session.clipPrompt || null,
     clipDuration: session.clipDuration || null,
+    loopPrompt: session.loopPrompt || null,
     choices: session.choices,
   }
 }
@@ -144,6 +180,7 @@ export function startGame(context, player) {
     const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
     commitTurn(candidate, turn, frame, 0)
     session = candidate // replace any previous game only once the opening turn succeeded
+    startIdleLoopRender(session, token) // opening frame's idle loop, renders while the player reads
     pendingStart = null
     return { frameUrl: toUrl(frame), choices: turn.choices.map(c => c.label), token }
   })
@@ -151,11 +188,15 @@ export function startGame(context, player) {
 
 // end the current game so a fresh one can be started, waits out any in-flight turn
 export function resetGame() {
-  resetInFlight ??= exclusive(async () => {
-    session = null
-    pendingStart = null
-    pendingRender = null
-  }, true).finally(() => { resetInFlight = null })
+  if (!resetInFlight) {
+    dropIdleLoop() // cancel a rendering idle loop right away, an in-flight turn stops waiting on it
+    resetInFlight = exclusive(async () => {
+      session = null
+      pendingStart = null
+      pendingRender = null
+      dropIdleLoop() // the turn that was in flight may have started another one meanwhile
+    }, true).finally(() => { resetInFlight = null })
+  }
   return resetInFlight
 }
 
@@ -187,6 +228,11 @@ export function chooseOption(index, clientToken) {
     }
     const next = await nextTurn(session, `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`, frame)
     commitTurn(session, next, frame, session.turn + 1)
+    // hold the turn until the new frame's idle loop is also rendered, so the loop is
+    // guaranteed ready the moment the clip ends and the handoff stays seamless,
+    // waiting in short slices so a queued reset isn't stuck behind a cosmetic render
+    const loopReady = startIdleLoopRender(session, token).then(() => true)
+    while (!(await Promise.race([loopReady, new Promise(r => setTimeout(r, 500))])) && !resetInFlight) {}
     session.clip = clip
     session.clipPrompt = choice.prompt
     session.clipDuration = choice.duration

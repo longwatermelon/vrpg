@@ -61,7 +61,8 @@ function sendJson(res, status, obj) {
 }
 
 // serve a static file from disk with the right mime type, supports byte ranges for video
-function serveFile(req, res, filePath) {
+// cacheable marks immutable rendered media so preloading warms the browser cache
+function serveFile(req, res, filePath, cacheable = false) {
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
     res.writeHead(404)
     return res.end('not found')
@@ -82,10 +83,16 @@ function serveFile(req, res, filePath) {
       'Content-Range': `bytes ${start}-${end}/${size}`,
       'Content-Length': end - start + 1,
       'Accept-Ranges': 'bytes',
+      ...(cacheable && { 'Cache-Control': 'public, max-age=86400' }),
     })
     return fs.createReadStream(filePath, { start, end }).pipe(res)
   }
-  res.writeHead(200, { 'Content-Type': type, 'Content-Length': size, 'Accept-Ranges': 'bytes' })
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Length': size,
+    'Accept-Ranges': 'bytes',
+    ...(cacheable && { 'Cache-Control': 'public, max-age=86400' }),
+  })
   fs.createReadStream(filePath).pipe(res)
 }
 
@@ -136,10 +143,11 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400)
       return res.end('bad path')
     }
-    const filePath = pathname.startsWith('/data/')
+    const isData = pathname.startsWith('/data/')
+    const filePath = isData
       ? path.join(ROOT, pathname)
       : path.join(ROOT, 'public', pathname === '/' ? 'index.html' : pathname)
-    return serveFile(req, res, filePath)
+    return serveFile(req, res, filePath, isData) // rendered media never changes once served
   } catch (err) {
     console.error(err)
     return sendJson(res, err.status || 500, { error: err.message })

@@ -21,7 +21,9 @@
   <div id="game-screen" hidden>
     <div id="stage">
       <img id="frame" hidden alt="current frame">
-      <video id="player" hidden playsinline></video>
+      <!-- two players: clips preload into the hidden one, then swap on stage with no load gap -->
+      <video id="player" hidden playsinline preload="auto"></video>
+      <video id="player-b" hidden playsinline preload="auto"></video>
     </div>
     <div id="status" hidden></div>
     <div id="choices"></div>
