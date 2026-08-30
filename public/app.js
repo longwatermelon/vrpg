@@ -28,12 +28,31 @@ async function api(path, body) {
   return data
 }
 
-// show a status line, styled as an error if flagged
+let statusTimer = null // interval driving the live elapsed counter, killed by any setStatus
+
+// show a status line, styled as an error if flagged, stops any running elapsed counter
 function setStatus(text, isError = false) {
+  clearInterval(statusTimer)
+  statusTimer = null
   const el = $('status')
   el.textContent = text
   el.hidden = !text
   el.classList.toggle('error', isError)
+}
+
+// format whole seconds as 42s or 1m 30s
+function fmtElapsed(s) {
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
+}
+
+// show a status line with a live elapsed counter, returns a fn that holds the final time
+function startTimer(label) {
+  const start = Date.now()
+  const elapsed = () => fmtElapsed(Math.floor((Date.now() - start) / 1000))
+  setStatus(`${label} ${elapsed()}`)
+  const id = setInterval(() => { $('status').textContent = `${label} ${elapsed()}` }, 1000)
+  statusTimer = id
+  return () => { if (statusTimer === id) setStatus(`Generated in ${elapsed()}`) } // superseded status wins otherwise
 }
 
 // show the frozen frame image instead of the video
@@ -71,8 +90,8 @@ async function loadDev(force = false) {
     if (!d.active) return (el.textContent = 'no active game')
     const parts = []
     if (d.scenePrompt) parts.push(`[opening frame prompt]\n${d.scenePrompt}`)
-    if (d.clipPrompt) parts.push(`[current clip prompt]\n${d.clipPrompt}`)
-    d.choices.forEach((c, i) => parts.push(`[option ${i + 1}: ${c.label}]\n${c.prompt}`))
+    if (d.clipPrompt) parts.push(`[current clip prompt (${d.clipDuration}s)]\n${d.clipPrompt}`)
+    d.choices.forEach((c, i) => parts.push(`[option ${i + 1}: ${c.label} (${c.duration}s)]\n${c.prompt}`))
     el.textContent = parts.join('\n\n')
     devToken = d.token // cache under the server's token, another tab may have advanced the game
   } catch (err) {
@@ -181,7 +200,7 @@ async function begin() {
   $('begin').disabled = true
   $('start-screen').hidden = true
   $('game-screen').hidden = false
-  setStatus('Generating opening scene... (1-3 minutes)')
+  const done = startTimer('Generating opening scene...')
   // capture the server's token first so a failed start can't recover an unrelated old game
   let baseline = currentToken
   try {
@@ -207,7 +226,7 @@ async function begin() {
   if (gen !== uiGen) return resync().catch(() => {}) // a game got created anyway, surface it instead of hiding it
   setToken(data.token)
   showFrame(data.frameUrl)
-  setStatus('')
+  done() // hold the final generation time
   renderChoices(data.choices)
 }
 
@@ -215,7 +234,7 @@ async function begin() {
 async function choose(index, labels) {
   const gen = uiGen
   setChoicesDisabled(true)
-  setStatus('Rendering clip... (about a minute)')
+  const done = startTimer('Rendering clip...')
   let data
   try {
     data = await api('/api/choose', { index, token: currentToken })
@@ -237,7 +256,7 @@ async function choose(index, labels) {
   if (gen !== uiGen) return
   // the server has advanced, from here on only the new choices may be shown
   setToken(data.token)
-  setStatus('')
+  done() // hold the final generation time
   await playClip(data.clipUrl, data.frameUrl, data.choices)
 }
 

@@ -26,17 +26,19 @@ So the user message is structured as `Choose option: <option label>\nAttached im
   "choices": [
     {
       "label": "Eat your girlfriend's sandwich",
-      "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him with a sandwich on her plate. Action: the man in the gray hoodie picks up the sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from the woman's plate and she sits glaring at the man."
+      "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him with a sandwich on her plate. Action: the man in the gray hoodie picks up the sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from the woman's plate and she sits glaring at the man.",
+      "duration": 8
     },
     {
       "label": "Get up and leave",
-      "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him. Action: the man in the gray hoodie rises from the table and walks out of the restaurant. The woman looks confused and says <d>[English] Hey, where are you going!?</d>."
+      "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him. Action: the man in the gray hoodie rises from the table and walks out of the restaurant. The woman looks confused and says <d>[English] Hey, where are you going!?</d>.",
+      "duration": 6
     }
   ]
 }
 ```
 
-Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; nothing is prepended. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
+Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; nothing is prepended. The `duration` field is the clip length in seconds, chosen by the LLM as an integer 5-15 (5 for a short one-shot action, 7-12 default, 15 for dialogue/fights/explanations) and passed straight to the video model. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
 
 ## Models
 

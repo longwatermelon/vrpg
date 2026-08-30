@@ -16,8 +16,12 @@ const RESPONSE_FORMAT = {
           maxItems: 3,
           items: {
             type: 'object',
-            properties: { label: { type: 'string' }, prompt: { type: 'string' } },
-            required: ['label', 'prompt'],
+            properties: {
+              label: { type: 'string' },
+              prompt: { type: 'string' },
+              duration: { type: 'integer', minimum: 5, maximum: 15 },
+            },
+            required: ['label', 'prompt', 'duration'],
             additionalProperties: false,
           },
         },
@@ -64,7 +68,8 @@ function parseChoices(raw) {
   const choices = parseJson(raw)?.choices
   if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
       choices.every(c => typeof c.label === 'string' && c.label.trim() &&
-                         typeof c.prompt === 'string' && c.prompt.trim())) {
+                         typeof c.prompt === 'string' && c.prompt.trim() &&
+                         Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15)) {
     return choices
   }
   return null

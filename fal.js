@@ -9,8 +9,8 @@ const TIMEOUT_MS = 10 * 60 * 1000
 const headers = { Authorization: `Key ${process.env.FAL_API_KEY}`, 'Content-Type': 'application/json' }
 const shortTimeout = () => AbortSignal.timeout(60 * 1000) // per-request cap so a stalled call can't hang the game
 
-// submit an image-to-video job to fal, returns the queue handle urls
-export async function submitJob(prompt, imageDataUri) {
+// submit an image-to-video job to fal, duration in seconds, returns the queue handle urls
+export async function submitJob(prompt, imageDataUri, duration) {
   const submit = await fetch(VIDEO_ENDPOINT, {
     method: 'POST',
     headers,
@@ -18,7 +18,7 @@ export async function submitJob(prompt, imageDataUri) {
     body: JSON.stringify({
       prompt,
       image_url: imageDataUri,
-      duration: 5,
+      duration,
       resolution: '480P',
       prompt_expansion_mode: 'balanced',
     }),

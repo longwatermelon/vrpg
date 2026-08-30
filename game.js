@@ -15,16 +15,18 @@ function systemPrompt(character) {
 The player controls one character in the story. Their appearance: ${character}
 
 Each turn you receive the player's chosen action plus an image of the frame where the story currently stands. Respond with ONLY a JSON object (no markdown fences, no commentary) offering 2-3 choices:
-{"choices": [{"label": "...", "prompt": "..."}]}
+{"choices": [{"label": "...", "prompt": "...", "duration": 8}]}
 
 "label" is a short action the player's character can take, e.g. "Eat the sandwich" or "Say: \\"What are you doing here?\\"".
 
-"prompt" describes a 5-second video clip starting from the current frame. The video model sees only the start keyframe and your prompt, nothing else, so each prompt must be self-contained: re-describe anything not visible in the frame, and refer to characters by appearance, never by name or story role (for the player's character, reuse the appearance above). If a character is off-screen, re-describe them and describe how they enter the scene.
+"prompt" describes a video clip starting from the current frame. The video model sees only the start keyframe and your prompt, nothing else, so each prompt must be self-contained: re-describe anything not visible in the frame, and refer to characters by appearance, never by name or story role (for the player's character, reuse the appearance above). If a character is off-screen, re-describe them and describe how they enter the scene.
+
+"duration" is the clip length in seconds, an integer from 5 to 15: 5 for a short one-shot action, 7-12 for most actions, 15 for explanations, back-and-forth dialogue, or fights.
 
 Make the story interesting and fun; be creative.
 
 Example response (player character: a tall young man with short brown hair in a gray hoodie; frame: him at dinner with his girlfriend, a sandwich on her plate - labels may use story knowledge, prompts may not):
-{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie."}, {"label": "Call the waiter over", "prompt": "The man in the gray hoodie sitting at the table raises his hand, and a middle-aged man in a white apron (currently off-screen) walks into view and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman watching him."}]}`
+{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie.", "duration": 8}, {"label": "Call the waiter over", "prompt": "The man in the gray hoodie sitting at the table raises his hand, and a middle-aged man in a white apron (currently off-screen) walks into view and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman watching him.", "duration": 6}]}`
 }
 
 let session = null // single in-memory session
@@ -112,6 +114,7 @@ export function getDebug() {
     token,
     scenePrompt: session.scenePrompt,
     clipPrompt: session.clipPrompt || null,
+    clipDuration: session.clipDuration || null,
     choices: session.choices,
   }
 }
@@ -170,7 +173,7 @@ export function chooseOption(index, clientToken) {
       throw new Error(`a render for "${session.choices[pendingRender.index].label}" is already pending, retry that choice`)
     }
     if (pendingRender?.token !== token) {
-      pendingRender = { token, index, job: await submitJob(choice.prompt, toDataUri(session.frame)), done: false }
+      pendingRender = { token, index, job: await submitJob(choice.prompt, toDataUri(session.frame), choice.duration), done: false }
     }
     if (!pendingRender.done) {
       try {
@@ -186,6 +189,7 @@ export function chooseOption(index, clientToken) {
     commitTurn(session, next, frame, session.turn + 1)
     session.clip = clip
     session.clipPrompt = choice.prompt
+    session.clipDuration = choice.duration
     pendingRender = null
     return { clipUrl: toUrl(clip), frameUrl: toUrl(frame), choices: next.choices.map(c => c.label), token }
   })
