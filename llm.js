@@ -112,10 +112,10 @@ const SCENE_FORMAT = {
   },
 }
 
-const SCENE_SYSTEM = `You are receiving a perspective written from the perspective of a character in a scene, along with a brief description of what that character looks like. Respond with ONLY a JSON object in exactly this format:
+const SCENE_SYSTEM = `You are receiving a scene description, along with a brief description of a character inside that scene. Respond with ONLY a JSON object in exactly this format:
 {"character": "...", "scene": "..."}
-  * "character": a concrete visual description of the player's character in one or two sentences (age, build, hair, clothing, distinguishing features) - only what a camera can see, no name or backstory. It gets pasted into image/video prompts to identify the character.
-  * "scene": a prompt for an image model rendering the scene the character is describing: the character should exist in third-person as just another character in the scene, and the scene around them should match the context the character describes.`
+  * "character": a more fleshed out and concrete visual description of the player's character in one or two sentences (age, build, hair, clothing, distinguishing features) - only what a camera can see, no name or backstory.
+  * "scene": a prompt for an image model rendering the scene described, including the character.`
 
 // parse and validate the scene json, null if invalid
 function parseScene(raw) {
