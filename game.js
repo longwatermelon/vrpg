@@ -110,7 +110,7 @@ export function startGame(context) {
     if (pendingStart?.context !== context) {
       const dir = path.join(DATA_DIR, String(Date.now()))
       fs.mkdirSync(dir, { recursive: true })
-      pendingStart = { context, dir, job: await submitImageJob(`First-person POV from the perspective of what a person who is describing the following scene is seeing: ${context}`) }
+      pendingStart = { context, dir, job: await submitImageJob(`First-person POV from the perspective of what a person who is describing the following scene is seeing: ${context}. REMEMBER: EXTREMELY IMPORTANT, GENERATE THE FIRST-PERSON POV FROM THE PERSPECTIVE OF THE NARRATOR DESCRIBING THIS SCENE. IT STRICTLY **MUST** BE FIRST-PERSON.`) }
     }
     const { dir } = pendingStart
     if (!pendingStart.frame) {
