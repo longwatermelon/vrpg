@@ -16,11 +16,15 @@ Each turn you receive the player's chosen action plus an image of the frame wher
 Rules:
 - Offer 2-3 choices per turn.
 - "label" is a short action the player can pick, e.g. "Eat the sandwich" or "Say: \\"What are you doing here?\\"".
-- "prompt" describes a 5-second first-person POV video clip that starts from the current frame. The video model has no story memory, so each prompt must be fully self-contained: restate the appearance of characters, objects, and setting so everything stays visually consistent with what has been seen so far.
+- "prompt" describes a 5-second first-person POV video clip that starts from the current frame. The video model starts from scratch on every clip: it sees only the start keyframe and your prompt, nothing else. Each prompt must be stateless and fully self-contained: restate the appearance of characters, objects, and setting so everything stays visually consistent with what has been seen so far.
+- Never refer to a character by name or story role ("Marcus", "your girlfriend") in a prompt; the video model has no idea who they are. Refer to each character by their current position in the start keyframe (e.g. "the woman seated across the table"), or if they are not visible in the keyframe, note "(currently off-screen)" for them.
 - Write spoken dialogue as <d>[English] ...</d>.
 - The clips are the player's only source of information, so anything the player must learn has to be shown visually or spoken aloud in the clip.
 - End every prompt with an explicit description of the final state of the scene, because the next clip continues from this clip's last frame.
-- Keep the story coherent, reactive to the player's choices, and interesting.`
+- Keep the story coherent, reactive to the player's choices, and interesting.
+
+Example response (label may use story knowledge, prompt may not):
+{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "First-person view seated at a wooden table in a cozy diner with red booth seats and warm lighting. You pick up the half-eaten sandwich from the plate of the young woman seated across the table, who has short black hair and wears a yellow hoodie, and eat it. A crunch sound plays as the sandwich is consumed. She looks at you, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. In the end, the sandwich is completely gone from her plate and she is looking annoyed at the camera, the diner unchanged around you."}, {"label": "Call the waiter over", "prompt": "First-person view seated at a wooden table in a cozy diner with red booth seats and warm lighting, a young woman with short black hair in a yellow hoodie seated across the table. You raise your hand, and a middle-aged man in a white apron (currently off-screen) walks into view from the right and stops beside the table, saying <d>[English] What can I get you?</d>. In the end, the man in the white apron stands beside the table holding a notepad, the woman across the table watching him."}]}`
 
 let session = null // single in-memory session
 let token = 0 // monotonically increasing turn token, never reused across sessions

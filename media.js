@@ -24,7 +24,7 @@ export async function extractLastFrame(videoPath, outPath) {
 // generate the opening frame with the image-gen cli, move it to outBase, return its path
 export async function generateInitialImage(context, outBase) {
   const dir = path.dirname(outBase)
-  const prompt = `Generate a 16:9 widescreen image: the opening frame of a first-person POV rpg game with this starting context: ${context}`
+  const prompt = `Generate a 16:9 widescreen image: a first-person POV opening frame for this starting context: ${context}`
   // cwd is the session dir so any files the cli drops stay contained
   const pending = run('image-gen', [prompt], { cwd: dir, timeout: 5 * 60 * 1000, maxBuffer: 10 * 1024 * 1024 })
   pending.child.stdin.end() // codex silently fails if stdin is left as an open pipe
