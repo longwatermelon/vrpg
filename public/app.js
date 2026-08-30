@@ -184,8 +184,8 @@ async function playClip(clipUrl, frameUrl, choices) {
   } catch (err) {
     if (gen !== playGen) return
     if (err.name !== 'NotAllowedError') return fallback()
-    // audible autoplay blocked (no recent gesture, e.g. the auto-picked opening
-    // clip), play muted so the action still shows; a click restores sound
+    // audible autoplay blocked (no recent gesture, e.g. a clip replayed right
+    // after a page refresh), play muted so the action still shows; a click restores sound
     v.muted = true
     setStatus('Click the video for sound')
     v.onclick = () => {
@@ -198,6 +198,11 @@ async function playClip(clipUrl, frameUrl, choices) {
 }
 
 let loop = null // idle loop controller for the current turn's frame
+
+// show the frozen frame only if the stage is still empty (opening turn with no loop)
+function ensureStage() {
+  if (video.hidden && $('frame').hidden) $('frame').hidden = false
+}
 
 // poll for the current turn's idle loop and play it on repeat until a clip takes over
 // plays from the moment it's ready: while the player picks and through the render wait
@@ -223,7 +228,7 @@ function startIdleLoop() {
       renderCost(state.cost) // free refresh while polling
       if (self.stopped || gen !== uiGen) return
       if (state.token !== self.token) return // the game advanced elsewhere, this loop is obsolete
-      if (state.loopFailed) return // no loop this turn, the frame stands
+      if (state.loopFailed) return ensureStage() // no loop this turn, the frame stands
       if (state.loopUrl) {
         const myGen = ++playGen
         const next = standby // preload off stage, the current picture holds until the loop is decoded
@@ -237,7 +242,9 @@ function startIdleLoop() {
         }
         next.muted = false // loops carry ambient audio like clips do
         next.src = state.loopUrl
-        next.onerror = () => {} // load failed, whatever's on stage stands
+        next.onerror = () => ensureStage() // load failed, whatever's on stage stands (the frame if nothing is)
+        // preload stalled with neither loadeddata nor error, don't hold an empty stage forever
+        setTimeout(() => { if (playGen === myGen && !self.playing) ensureStage() }, 15000)
         next.onloadeddata = () => {
           if (playGen !== myGen || self.stopped) return
           swapPlayers() // the decoded loop takes the stage with no load gap
@@ -380,7 +387,8 @@ async function resumeStory(id) {
   if (gen !== uiGen) return
   setToken(data.token)
   setStatus('')
-  showFrame(data.frameUrl)
+  // stage the frame hidden, the idle loop takes the stage (ensureStage reveals the frame if it can't)
+  $('frame').src = data.frameUrl
   renderChoices(data.choices)
 }
 
@@ -435,10 +443,9 @@ async function resync(mustAdvancePast = null) {
   setStatus('Recovered current game state') // replace any stale progress or error text
   if (advanced && state.clipUrl && !state.loadedClip) {
     await playClip(state.clipUrl, state.frameUrl, state.choices) // the missed clip
-  } else if (!state.clipUrl && state.autoPick) {
-    await choose(0, state.choices, state.frameUrl) // recovered opening turn, keep the auto-pick invariant
   } else {
-    showFrame(state.frameUrl)
+    // stage the frame hidden, the idle loop takes the stage (ensureStage reveals the frame if it can't)
+    $('frame').src = state.frameUrl
     renderChoices(state.choices)
   }
   return true
@@ -454,7 +461,7 @@ async function begin() {
   $('begin').disabled = true
   $('start-screen').hidden = true
   $('game-screen').hidden = false
-  startTimer('Generating opening scene...')
+  const done = startTimer('Generating opening scene...')
   // capture the server's token first so a failed start can't recover an unrelated old game
   let baseline = currentToken
   try {
@@ -479,14 +486,15 @@ async function begin() {
   }
   if (gen !== uiGen) return resync().catch(() => {}) // a game got created anyway, surface it instead of hiding it
   setToken(data.token)
-  // auto-pick the first option instead of showing the opening frame: the screen
-  // stays empty until the opening clip can play, so the first thing seen is action
-  await choose(0, data.choices, data.frameUrl)
+  done() // hold the final generation time
+  // the opening loop is rendered by the time start returns; keep the frame as a
+  // hidden fallback and let startIdleLoop put the loop on stage, never the frame
+  $('frame').src = data.frameUrl
+  renderChoices(data.choices)
 }
 
 // pick a choice, render the clip, play it, then show the next choices
-// fallbackFrame: frame to put on stage if the choice fails while the screen is still empty
-async function choose(index, labels, fallbackFrame = null) {
+async function choose(index, labels) {
   const gen = uiGen
   setChoicesDisabled(true)
   const done = startTimer('Rendering clip...')
@@ -513,7 +521,6 @@ async function choose(index, labels, fallbackFrame = null) {
     }
     if (gen !== uiGen) return
     setStatus(err.message, true) // resync's progress text may have replaced the error
-    if (fallbackFrame) showFrame(fallbackFrame) // nothing was on stage yet, put the frame up
     renderChoices(labels) // server did not advance, the old choices and error stand
     return
   }

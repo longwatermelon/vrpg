@@ -163,7 +163,6 @@ export function getState() {
     token,
     frameUrl: toUrl(session.frame),
     clipUrl: session.clip ? toUrl(session.clip) : null,
-    autoPick: !session.clip && !session.loaded, // opening turn of a fresh game still wants its auto-pick
     loadedClip: !!(session.clip && session.loaded), // historical clip of a resumed story, not a missed turn
     loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
     loopFailed: idleLoop?.token === token ? !!idleLoop.failed : true, // no loop entry means none is coming, stop waiting
@@ -213,9 +212,12 @@ export function startGame(context, player) {
     saveSession(candidate) // persist first so a failed save fails the start cleanly, memory untouched
     session = candidate // replace any previous game only once the opening turn succeeded
     token++
-    dropIdleLoop() // a replaced game's loop may still be rendering, stop paying for it
-    // no idle loop for the opening turn: the client auto-picks the first choice
-    // immediately, so this frame's choices are normally never shown
+    // hold the start until the opening frame's idle loop is rendered, so the first
+    // thing the player sees is the scene in motion, never the static frame,
+    // waiting in short slices so a queued reset isn't stuck behind a cosmetic render
+    // (this also drops a replaced game's still-rendering loop)
+    const loopReady = startIdleLoopRender(session, token).then(() => true)
+    while (!(await Promise.race([loopReady, new Promise(r => setTimeout(r, 500))])) && !resetInFlight) {}
     pendingStart = null
     return { frameUrl: toUrl(frame), choices: turn.choices.map(c => c.label), token }
   })
@@ -352,7 +354,7 @@ export function loadStory(id) {
       messages: d.messages,
       choices: d.choices,
       loopPrompt: d.loopPrompt,
-      loaded: true, // a resumed opening turn shows its choices, no auto-pick
+      loaded: true, // marks the saved clip as historical so resync won't replay it
     }
     if (!isFile(s.frame)) throw new Error('story frame is missing on disk')
     if (d.clip && isFile(path.join(dir, d.clip))) {
