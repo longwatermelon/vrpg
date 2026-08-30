@@ -145,7 +145,7 @@ async function playClip(clipUrl, frameUrl, choices) {
   if (loop && !loop.playing) loop.stop() // a loop that never made it on stage is stale, free its standby element
   new Image().src = frameUrl // warm the browser cache off-screen, fallbacks may need the outcome frame instantly
   // preload the clip into the standby element so the swap onto the stage has no load gap
-  standby.muted = false // idle loops play muted, clips carry the audio
+  standby.muted = false // make sure audio is on whatever the element played before
   standby.src = clipUrl
   const loaded = new Promise(r => { standby.onloadeddata = () => r(true); standby.onerror = () => r(false) })
   if (loop && !loop.stopped && loop.playing) {
@@ -232,7 +232,7 @@ function startIdleLoop() {
           $('frame').hidden = false
           if (self.handoff) self.handoff()
         }
-        next.muted = true // repetitive loop audio off, also lets autoplay through without a fresh gesture
+        next.muted = false // loops carry ambient audio like clips do
         next.src = state.loopUrl
         next.onerror = () => {} // load failed, whatever's on stage stands
         next.onloadeddata = () => {
@@ -247,7 +247,20 @@ function startIdleLoop() {
             v.play().catch(fail)
           }
           v.onerror = fail
-          v.play().catch(fail) // autoplay refused or broken, the frame stands
+          v.play().catch(err => {
+            if (err.name !== 'NotAllowedError') return fail()
+            // no gesture yet (fresh page load), start muted so the loop still shows
+            v.muted = true
+            // stale info text may be replaced, only a live render timer is preserved
+            // (a running timer implies a prior click, so audible autoplay wouldn't be blocked then anyway)
+            if (!statusTimer) setStatus('Click the video for sound')
+            v.onclick = () => {
+              v.onclick = null
+              v.muted = false // first click restores audio
+              if ($('status').textContent === 'Click the video for sound') setStatus('')
+            }
+            v.play().catch(fail)
+          })
         }
         return
       }

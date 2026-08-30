@@ -35,7 +35,7 @@ export async function submitJob(prompt, imageDataUri, duration, endImageDataUri)
     headers,
     signal: shortTimeout(),
     body: JSON.stringify({
-      prompt,
+      prompt: `${prompt} no music generation, only sound effects`, // suppress the model's soundtrack on every render
       image_url: imageDataUri,
       ...(endImageDataUri && { end_image_url: endImageDataUri }),
       duration,
