@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>vrpg</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- start screen: player describes the story context -->
+  <div id="start-screen">
+    <h1>vrpg</h1>
+    <p>Describe the starting point of your story.</p>
+    <textarea id="context" rows="4" maxlength="2000" placeholder="e.g. I wake up in a medieval tavern with no memory, a hooded figure sits across from me..."></textarea>
+    <button id="begin">Begin</button>
+  </div>
+
+  <!-- game screen: video stage plus choice buttons -->
+  <div id="game-screen" hidden>
+    <div id="stage">
+      <img id="frame" hidden alt="current frame">
+      <video id="player" hidden playsinline></video>
+    </div>
+    <div id="status" hidden></div>
+    <div id="choices"></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
