@@ -16,7 +16,7 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, getState, getDebug, resetGame } = await import('./game.js') // import after env is loaded
+const { startGame, chooseOption, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory } = await import('./game.js') // import after env is loaded
 
 const MIME = {
   '.html': 'text/html',
@@ -131,6 +131,21 @@ const server = http.createServer(async (req, res) => {
       await resetGame()
       return sendJson(res, 200, { ok: true })
     }
+    if (req.method === 'GET' && url.pathname === '/api/stories') {
+      return sendJson(res, 200, { stories: listStories() })
+    }
+    if (req.method === 'POST' && url.pathname === '/api/load') {
+      const { id } = await readJson(req)
+      return sendJson(res, 200, await loadStory(id))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/delete') {
+      const { id } = await readJson(req)
+      return sendJson(res, 200, await deleteStory(id))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/render') {
+      const { id } = await readJson(req)
+      return sendJson(res, 200, await renderStory(id))
+    }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(res, 200, getState())
     }
@@ -144,6 +159,10 @@ const server = http.createServer(async (req, res) => {
       return res.end('bad path')
     }
     const isData = pathname.startsWith('/data/')
+    if (isData && !MIME[path.extname(pathname).toLowerCase()]) {
+      res.writeHead(403) // only media leaves data/, transcripts stay private
+      return res.end('forbidden')
+    }
     const filePath = isData
       ? path.join(ROOT, pathname)
       : path.join(ROOT, 'public', pathname === '/' ? 'index.html' : pathname)

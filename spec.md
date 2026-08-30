@@ -44,6 +44,10 @@ Use start keyframe = current frozen frame, send the prompt field directly to the
 
 The top-level `loop-prompt` field describes a 5s idle animation of the current frame (the one the choices are offered on): camera roughly still, characters doing subtle believable idle motion, ending back exactly at the start pose so it loops seamlessly. It renders with duration 5 and the current frame as both start keyframe and `end_image_url`, forcing the loop closed. The choose turn only returns once both the main clip and this loop are rendered, so the loop is guaranteed ready when the clip finishes playing. The opening turn renders no loop: its first choice is auto-picked, so its choices only appear in the clean-failure fallback.
 
+## Saved stories
+
+Every committed turn writes `session.json` into the story's `data/<id>/` dir: the full LLM transcript (images stripped, the frames live on disk), current choices, prompts, and turn state. The start screen lists all story dirs found in `data/`, each shown with its last frame as thumbnail. A story with a `session.json` can be resumed: the server loads it as the active session and the player continues from the last frame (reusing the already-rendered idle loop for that frame if present). Render stitches the story's main clips (`clip-*.mp4`, loops excluded) into one `story.mp4` via ffmpeg re-encode and the browser downloads it; the result is cached until a newer clip lands. Delete removes the story dir permanently (refused while that story is being played).
+
 ## Models
 
 LLM: accessed via OpenRouter.

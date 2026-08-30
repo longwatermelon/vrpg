@@ -3,7 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chatChoices, startScene, getLlmCost } from './llm.js'
 import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob, getFalCost } from './fal.js'
-import { extractLastFrame } from './media.js'
+import { extractLastFrame, concatClips } from './media.js'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(ROOT, 'data')
@@ -116,15 +116,34 @@ function stripImage(msg) {
   return { ...msg, content: msg.content.filter(p => p.type !== 'image_url') }
 }
 
-// commit a finished turn to session s, only called after every step succeeded
-function commitTurn(s, { msgs, choices, loopPrompt }, frame, turn) {
-  s.messages = s.messages.map(stripImage) // keep stored history slim, images live on disk
-  s.messages.push(...msgs)
+// persist the session transcript and turn state into its dir so the story can be resumed
+function saveSession(s) {
+  const data = {
+    context: s.context,
+    player: s.player,
+    character: s.character,
+    scenePrompt: s.scenePrompt,
+    messages: s.messages.map(stripImage), // images live on disk as frames
+    choices: s.choices,
+    loopPrompt: s.loopPrompt,
+    turn: s.turn,
+    frame: path.basename(s.frame),
+    clip: s.clip ? path.basename(s.clip) : null,
+    clipPrompt: s.clipPrompt || null,
+    clipDuration: s.clipDuration || null,
+  }
+  const file = path.join(s.dir, 'session.json')
+  fs.writeFileSync(file + '.tmp', JSON.stringify(data))
+  fs.renameSync(file + '.tmp', file) // atomic so a crash can't leave a torn save
+}
+
+// apply a finished turn to session object s; callers persist to disk, then publish
+function applyTurn(s, { msgs, choices, loopPrompt }, frame, turn) {
+  s.messages = [...s.messages.map(stripImage), ...msgs] // keep stored history slim, images live on disk
   s.choices = choices
   s.loopPrompt = loopPrompt
   s.frame = frame
   s.turn = turn
-  token++
 }
 
 // running api spend for this process, exact for openrouter, rate-estimated for fal
@@ -144,6 +163,8 @@ export function getState() {
     token,
     frameUrl: toUrl(session.frame),
     clipUrl: session.clip ? toUrl(session.clip) : null,
+    autoPick: !session.clip && !session.loaded, // opening turn of a fresh game still wants its auto-pick
+    loadedClip: !!(session.clip && session.loaded), // historical clip of a resumed story, not a missed turn
     loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
     loopFailed: idleLoop?.token === token ? !!idleLoop.failed : true, // no loop entry means none is coming, stop waiting
     choices: session.choices.map(c => c.label),
@@ -186,10 +207,12 @@ export function startGame(context, player) {
       }
     }
     const frame = pendingStart.frame
-    const candidate = { dir, turn: 0, frame, scenePrompt: scene, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
+    const candidate = { dir, turn: 0, frame, context, player, character, scenePrompt: scene, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
     const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
-    commitTurn(candidate, turn, frame, 0)
+    applyTurn(candidate, turn, frame, 0)
+    saveSession(candidate) // persist first so a failed save fails the start cleanly, memory untouched
     session = candidate // replace any previous game only once the opening turn succeeded
+    token++
     dropIdleLoop() // a replaced game's loop may still be rendering, stop paying for it
     // no idle loop for the opening turn: the client auto-picks the first choice
     // immediately, so this frame's choices are normally never shown
@@ -239,16 +262,157 @@ export function chooseOption(index, clientToken) {
       pendingRender.done = true
     }
     const next = await nextTurn(session, `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`, frame)
-    commitTurn(session, next, frame, session.turn + 1)
+    // stage the committed state on a copy and persist it before publishing in memory,
+    // so a failed disk save leaves the turn cleanly retryable
+    const committed = { ...session }
+    applyTurn(committed, next, frame, session.turn + 1)
+    committed.loaded = false // this clip is newly committed, resync may replay it
+    committed.clip = clip
+    committed.clipPrompt = choice.prompt
+    committed.clipDuration = choice.duration
+    saveSession(committed)
+    session = committed
+    token++
     // hold the turn until the new frame's idle loop is also rendered, so the loop is
     // guaranteed ready the moment the clip ends and the handoff stays seamless,
     // waiting in short slices so a queued reset isn't stuck behind a cosmetic render
     const loopReady = startIdleLoopRender(session, token).then(() => true)
     while (!(await Promise.race([loopReady, new Promise(r => setTimeout(r, 500))])) && !resetInFlight) {}
-    session.clip = clip
-    session.clipPrompt = choice.prompt
-    session.clipDuration = choice.duration
     pendingRender = null
     return { clipUrl: toUrl(clip), frameUrl: toUrl(frame), choices: next.choices.map(c => c.label), token }
   })
+}
+
+// resolve a story id to its directory under data/, rejecting anything unsafe
+function storyDir(id) {
+  if (typeof id !== 'string' || !/^\d+$/.test(id)) {
+    const err = new Error('invalid story id')
+    err.status = 400
+    throw err
+  }
+  return path.join(DATA_DIR, id)
+}
+
+// numeric suffix of a frame/clip/loop filename, for ordering
+function fileNum(name) {
+  return parseInt(name.match(/\d+/)[0])
+}
+
+// list saved stories in data/, newest first, each with its last frame as thumbnail
+export function listStories() {
+  if (!fs.existsSync(DATA_DIR)) return []
+  const out = []
+  for (const name of fs.readdirSync(DATA_DIR)) {
+    if (!/^\d+$/.test(name)) continue
+    const dir = path.join(DATA_DIR, name)
+    if (!fs.statSync(dir).isDirectory()) continue
+    const files = fs.readdirSync(dir)
+    const frames = files.filter(f => /^frame-\d+\.(jpg|jpeg|png|webp)$/.test(f)).sort((a, b) => fileNum(a) - fileNum(b))
+    if (!frames.length) continue // nothing to show
+    let meta = null // stories from before transcripts were saved have no session.json
+    try { meta = JSON.parse(fs.readFileSync(path.join(dir, 'session.json'), 'utf8')) } catch {}
+    // bound to committed progress, a failed turn can leave orphan files behind
+    const clips = files.filter(f => /^clip-\d+\.mp4$/.test(f) && (!meta || fileNum(f) < meta.turn))
+    const frame = meta && files.includes(meta.frame) ? meta.frame : frames[frames.length - 1]
+    out.push({
+      id: name,
+      frameUrl: toUrl(path.join(dir, frame)),
+      clips: clips.length,
+      context: meta?.context || null,
+      resumable: !!meta,
+    })
+  }
+  return out.sort((a, b) => Number(b.id) - Number(a.id))
+}
+
+// load a saved story from disk as the active session so the player can resume it
+export function loadStory(id) {
+  const dir = storyDir(id)
+  return exclusive(async () => {
+    const file = path.join(dir, 'session.json')
+    if (!fs.existsSync(file)) throw new Error('story has no saved transcript, it cannot be resumed')
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'))
+    // validate the saved shape fully before touching global state
+    if (!Number.isInteger(d.turn) || d.turn < 0 ||
+        typeof d.frame !== 'string' || !/^frame-\d+\.(jpg|jpeg|png|webp)$/.test(d.frame) ||
+        (d.clip != null && (typeof d.clip !== 'string' || !/^clip-\d+\.mp4$/.test(d.clip))) ||
+        !Array.isArray(d.messages) || !Array.isArray(d.choices) || typeof d.loopPrompt !== 'string' ||
+        !d.choices.every(c => typeof c?.label === 'string' && typeof c?.prompt === 'string' && Number.isInteger(c?.duration))) {
+      throw new Error('saved transcript is corrupt')
+    }
+    const isFile = f => fs.existsSync(f) && fs.statSync(f).isFile()
+    const s = {
+      dir,
+      turn: d.turn,
+      frame: path.join(dir, d.frame),
+      context: d.context,
+      player: d.player,
+      character: d.character,
+      scenePrompt: d.scenePrompt,
+      messages: d.messages,
+      choices: d.choices,
+      loopPrompt: d.loopPrompt,
+      loaded: true, // a resumed opening turn shows its choices, no auto-pick
+    }
+    if (!isFile(s.frame)) throw new Error('story frame is missing on disk')
+    if (d.clip && isFile(path.join(dir, d.clip))) {
+      s.clip = path.join(dir, d.clip)
+      s.clipPrompt = d.clipPrompt
+      s.clipDuration = d.clipDuration
+    }
+    // everything checked out, publish as the active session
+    session = s
+    pendingStart = null
+    pendingRender = null
+    token++
+    dropIdleLoop()
+    // reuse the idle loop already rendered for this frame instead of paying again
+    const loopFile = path.join(dir, `loop-${s.turn}.mp4`)
+    if (fs.existsSync(loopFile)) idleLoop = { token, url: toUrl(loopFile) }
+    return { frameUrl: toUrl(s.frame), choices: s.choices.map(c => c.label), token }
+  })
+}
+
+// permanently delete a saved story directory
+export async function deleteStory(id) {
+  const dir = storyDir(id)
+  if (session?.dir === dir || pendingStart?.dir === dir) throw new Error('story is currently being played, restart first')
+  if (renders.has(id)) throw new Error('story is being rendered, wait for it to finish')
+  if (!fs.existsSync(dir)) throw new Error('story not found')
+  fs.rmSync(dir, { recursive: true, force: true })
+  return { ok: true }
+}
+
+const renders = new Map() // per-story render chain, serializes concurrent requests
+
+// stitch a story's main clips (loops excluded) into one downloadable mp4
+export function renderStory(id) {
+  const dir = storyDir(id)
+  // run after any in-flight render for this story, then recheck freshness,
+  // so a request made after a newer clip lands never gets a stale snapshot
+  const prev = renders.get(id) || Promise.resolve()
+  const p = prev.catch(() => {}).then(async () => {
+    if (!fs.existsSync(dir)) throw new Error('story not found')
+    const metaFile = path.join(dir, 'session.json')
+    let meta = null // committed progress bound, a failed turn can leave an orphan clip
+    try { meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')) } catch {}
+    const started = Date.now() // clip list snapshot moment
+    const clips = fs.readdirSync(dir)
+      .filter(f => /^clip-\d+\.mp4$/.test(f) && (!meta || fileNum(f) < meta.turn))
+      .sort((a, b) => fileNum(a) - fileNum(b))
+      .map(f => path.join(dir, f))
+    if (!clips.length) throw new Error('story has no clips to render')
+    const out = path.join(dir, 'story.mp4')
+    // reuse a previous render unless a newer clip or commit has landed since;
+    // the commit check catches a clip excluded because its turn was still mid-save
+    let newest = Math.max(...clips.map(f => fs.statSync(f).mtimeMs))
+    if (meta) try { newest = Math.max(newest, fs.statSync(metaFile).mtimeMs) } catch {}
+    if (!fs.existsSync(out) || fs.statSync(out).mtimeMs <= newest) {
+      await concatClips(clips, out)
+      fs.utimesSync(out, new Date(started), new Date(started)) // a clip landing mid-render still reads as newer
+    }
+    return { url: `${toUrl(out)}?v=${fs.statSync(out).mtimeMs}` } // versioned, the browser must not serve a stale cached render
+  }).finally(() => { if (renders.get(id) === p) renders.delete(id) })
+  renders.set(id, p)
+  return p
 }

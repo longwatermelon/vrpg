@@ -299,6 +299,118 @@ function toStartScreen() {
   $('game-screen').hidden = true
   $('start-screen').hidden = false
   setStatus('')
+  loadStories() // refresh the saved stories list
+}
+
+// small pill button for a story card
+function storyBtn(label, onclick, primary = false) {
+  const btn = document.createElement('button')
+  btn.textContent = label
+  btn.onclick = onclick
+  if (primary) btn.classList.add('primary')
+  return btn
+}
+
+let storiesGen = 0 // bumped per fetch so only the latest list render wins
+
+// fetch saved stories and render the list on the start screen
+async function loadStories() {
+  const gen = ++storiesGen
+  let stories = []
+  try { stories = (await (await fetch('/api/stories')).json()).stories || [] } catch {}
+  if (gen !== storiesGen) return // superseded, don't touch the list
+  const box = $('stories')
+  box.innerHTML = ''
+  $('stories-section').hidden = !stories.length
+  for (const s of stories) {
+    const card = document.createElement('div')
+    card.className = 'story'
+    const img = document.createElement('img')
+    img.src = s.frameUrl
+    img.alt = 'last frame'
+    img.loading = 'lazy'
+    const info = document.createElement('div')
+    info.className = 'story-info'
+    const title = document.createElement('div')
+    title.className = 'story-title'
+    title.textContent = s.context || 'untitled story'
+    const meta = document.createElement('div')
+    meta.className = 'story-meta'
+    meta.textContent = `${new Date(Number(s.id)).toLocaleString()} · ${s.clips} clip${s.clips === 1 ? '' : 's'}`
+    const actions = document.createElement('div')
+    actions.className = 'story-actions'
+    if (s.resumable) actions.appendChild(storyBtn('Resume', () => resumeStory(s.id), true))
+    if (s.clips > 0) actions.appendChild(storyBtn('Render', e => renderStory(s.id, e.target)))
+    actions.appendChild(storyBtn('Delete', () => deleteStory(s.id)))
+    info.append(title, meta, actions)
+    card.append(img, info)
+    box.appendChild(card)
+  }
+}
+
+// load a saved story server-side and drop back into the game at its last frame
+async function resumeStory(id) {
+  toStartScreen() // cancel any in-flight flows first
+  const gen = uiGen
+  $('start-screen').hidden = true
+  $('game-screen').hidden = false
+  setStatus('Loading story...')
+  // capture the server's token first so a lost response can be told apart from a real failure
+  let baseline = currentToken
+  try {
+    const state = await (await fetch('/api/state')).json()
+    if (state.active) baseline = state.token
+  } catch {}
+  if (gen !== uiGen) return
+  let data
+  try {
+    data = await api('/api/load', { id })
+  } catch (err) {
+    if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
+    // the story may have loaded server-side with only the response lost,
+    // recover only if the server moved beyond the pre-load baseline
+    try {
+      if (await resync(baseline)) return
+    } catch {}
+    if (gen !== uiGen) return
+    toStartScreen()
+    alert(err.message)
+    return
+  }
+  if (gen !== uiGen) return
+  setToken(data.token)
+  setStatus('')
+  showFrame(data.frameUrl)
+  renderChoices(data.choices)
+}
+
+// render the story's main clips into one video server-side, then download it
+async function renderStory(id, btn) {
+  btn.disabled = true
+  const old = btn.textContent
+  btn.textContent = 'Rendering...'
+  try {
+    const { url } = await api('/api/render', { id })
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `vrpg-story-${id}.mp4`
+    a.click()
+  } catch (err) {
+    alert(err.message)
+  }
+  btn.textContent = old
+  btn.disabled = false
+}
+
+// delete a saved story after confirmation and refresh the list
+async function deleteStory(id) {
+  if (!confirm('Delete this story permanently?')) return
+  try {
+    await api('/api/delete', { id })
+  } catch (err) {
+    alert(err.message)
+  }
+  loadStories()
 }
 
 // resync the ui with the server's current session state after an ambiguous failure
@@ -321,9 +433,9 @@ async function resync(mustAdvancePast = null) {
   $('start-screen').hidden = true
   $('game-screen').hidden = false
   setStatus('Recovered current game state') // replace any stale progress or error text
-  if (advanced && state.clipUrl) {
+  if (advanced && state.clipUrl && !state.loadedClip) {
     await playClip(state.clipUrl, state.frameUrl, state.choices) // the missed clip
-  } else if (!state.clipUrl) {
+  } else if (!state.clipUrl && state.autoPick) {
     await choose(0, state.choices, state.frameUrl) // recovered opening turn, keep the auto-pick invariant
   } else {
     showFrame(state.frameUrl)
