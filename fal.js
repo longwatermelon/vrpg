@@ -20,7 +20,7 @@ export async function submitJob(prompt, imageDataUri) {
       image_url: imageDataUri,
       duration: 5,
       resolution: '480P',
-      prompt_expansion_mode: 'disabled',
+      prompt_expansion_mode: 'balanced',
     }),
   })
   if (!submit.ok) throw new Error(`fal submit failed: ${submit.status} ${await submit.text()}`)
