@@ -6,6 +6,24 @@ const IMAGE_ENDPOINT = 'https://queue.fal.run/fal-ai/bytedance/seedream/v4.5/tex
 const POLL_MS = 750
 const TIMEOUT_MS = 10 * 60 * 1000
 
+// fal returns no price field, so spend is estimated from published rates
+const IMAGE_COST = 0.04 // seedream 4.5 flat rate per image
+
+// h3 max 480p rate per second, launch promo ends sept 1
+function videoRate() { return Date.now() < Date.parse('2026-09-01') ? 0.025 : 0.05 }
+
+let cost = 0 // running fal spend in usd for this process
+
+// running fal spend in usd
+export function getFalCost() { return cost }
+
+// count a completed job's cost once, a retried await must not charge twice
+function charge(job, amount) {
+  if (job.charged) return
+  job.charged = true
+  cost += amount
+}
+
 const headers = { Authorization: `Key ${process.env.FAL_API_KEY}`, 'Content-Type': 'application/json' }
 const shortTimeout = () => AbortSignal.timeout(60 * 1000) // per-request cap so a stalled call can't hang the game
 
@@ -26,7 +44,9 @@ export async function submitJob(prompt, imageDataUri, duration, endImageDataUri)
     }),
   })
   if (!submit.ok) throw new Error(`fal submit failed: ${submit.status} ${await submit.text()}`)
-  return await submit.json()
+  const job = await submit.json()
+  job.cost = videoRate() * duration // rate decided per job, kept for accounting on completion
+  return job
 }
 
 // best-effort cancel of a queued fal job so an abandoned render stops billing
@@ -77,6 +97,7 @@ async function pollResult({ status_url, response_url, cancel_url }) {
 // wait for a submitted image-to-video job and download the clip to outPath
 export async function awaitJob(job, outPath) {
   const { video } = await pollResult(job)
+  charge(job, job.cost) // the render completed, it billed
   if (!video?.url) {
     const err = new Error('fal returned no video url')
     err.terminal = true
@@ -102,6 +123,7 @@ export async function submitImageJob(prompt) {
 // wait for a submitted image job, save it as outBase plus extension, return the path
 export async function awaitImageJob(job, outBase) {
   const { images } = await pollResult(job)
+  charge(job, IMAGE_COST) // the render completed, it billed
   const image = images?.[0]
   if (!image?.url) {
     const err = new Error('fal returned no image url')

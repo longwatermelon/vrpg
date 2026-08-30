@@ -29,6 +29,12 @@
       <video id="player-b" hidden playsinline preload="auto"></video>
     </div>
     <div id="status" hidden></div>
+    <!-- cost tracker: running api spend, top left -->
+    <div id="cost" hidden>
+      <span>llm</span><span class="amt" id="cost-llm"></span>
+      <span>fal</span><span class="amt" id="cost-fal"></span>
+      <span>total</span><span class="amt" id="cost-total"></span>
+    </div>
     <div id="choices"></div>
     <!-- dev panel: shows the llm-generated prompts behind the current turn -->
     <details id="dev">

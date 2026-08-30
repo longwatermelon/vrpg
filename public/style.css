@@ -130,7 +130,7 @@ textarea:focus-visible {
   transform: translateX(-50%);
   z-index: 1; /* stays above the choices scrim on short screens */
   pointer-events: none; /* never intercepts clicks meant for choices */
-  max-width: min(640px, calc(100vw - 240px)); /* keep clear of the restart pill */
+  max-width: min(640px, calc(100vw - 320px)); /* keep clear of the corner pills */
   padding: 8px 18px;
   border: 1px solid var(--hairline);
   border-radius: 999px;
@@ -145,15 +145,6 @@ textarea:focus-visible {
 #status.error {
   color: #ff9b8a;
   border-color: rgba(255, 155, 138, 0.35);
-}
-
-/* narrow screens: drop the status below the restart pill so they can't overlap */
-@media (max-width: 600px) {
-  #status {
-    top: 64px;
-    max-width: calc(100vw - 32px);
-  }
-  #choices { padding-top: 116px; } /* clear the lowered status pill */
 }
 
 /* choices rise over a bottom scrim like dialogue options */
@@ -173,6 +164,15 @@ textarea:focus-visible {
 }
 
 #choices:empty { display: none; } /* no scrim between turns */
+
+/* narrow screens: drop the status below the corner elements so they can't overlap */
+@media (max-width: 600px) {
+  #status {
+    top: 96px;
+    max-width: calc(100vw - 32px);
+  }
+  #choices { padding-top: 148px; } /* clear the lowered status pill */
+}
 
 #choices button {
   display: flex;
@@ -229,6 +229,36 @@ textarea:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   #choices button { animation: none; }
 }
+
+/* cost tracker, small panel in the top left */
+#cost {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 1; /* stays above the choices scrim on short screens */
+  pointer-events: none;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 12px;
+  padding: 8px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  background: var(--glass);
+  backdrop-filter: blur(10px);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+#cost .amt {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+#cost .amt#cost-total { color: var(--ember); }
 
 /* restart, ghost pill in the corner */
 #restart {

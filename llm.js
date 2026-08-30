@@ -33,6 +33,11 @@ const RESPONSE_FORMAT = {
   },
 }
 
+let cost = 0 // running openrouter spend in usd for this process
+
+// running openrouter spend in usd
+export function getLlmCost() { return cost }
+
 // call openrouter chat completions and return the assistant text, format is an optional response_format
 async function complete(messages, format) {
   const res = await fetch(API_URL, {
@@ -44,6 +49,7 @@ async function complete(messages, format) {
     body: JSON.stringify({
       model: MODEL,
       messages,
+      usage: { include: true }, // harmless opt-in in case usage reporting isn't automatic
       ...(format && {
         response_format: format,
         provider: { require_parameters: true }, // only route to endpoints that honor the schema
@@ -53,6 +59,7 @@ async function complete(messages, format) {
   })
   if (!res.ok) throw new Error(`openrouter request failed: ${res.status} ${await res.text()}`)
   const data = await res.json()
+  cost += data.usage?.cost || 0 // billed even when the content turns out unusable
   const text = data.choices?.[0]?.message?.content
   if (!text) throw new Error(`openrouter returned no content: ${JSON.stringify(data).slice(0, 500)}`)
   return text

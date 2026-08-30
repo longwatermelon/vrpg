@@ -1,8 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chatChoices, startScene } from './llm.js'
-import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob } from './fal.js'
+import { chatChoices, startScene, getLlmCost } from './llm.js'
+import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob, getFalCost } from './fal.js'
 import { extractLastFrame } from './media.js'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
@@ -127,10 +127,17 @@ function commitTurn(s, { msgs, choices, loopPrompt }, frame, turn) {
   token++
 }
 
+// running api spend for this process, exact for openrouter, rate-estimated for fal
+function getCost() {
+  const llm = getLlmCost()
+  const fal = getFalCost()
+  return { llm, fal, total: llm + fal }
+}
+
 // snapshot of the current session so the client can resync after a lost response
 export function getState() {
   const settling = busy || resetInFlight !== null // a queued reset counts as busy
-  if (!session) return { active: false, busy: settling }
+  if (!session) return { active: false, busy: settling, cost: getCost() }
   return {
     active: true,
     busy: settling,
@@ -140,6 +147,7 @@ export function getState() {
     loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
     loopFailed: idleLoop?.token === token ? !!idleLoop.failed : false, // tells the client to stop waiting for one
     choices: session.choices.map(c => c.label),
+    cost: getCost(),
   }
 }
 

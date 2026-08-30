@@ -90,7 +90,23 @@ function renderChoices(labels) {
     box.appendChild(btn)
   })
   if ($('dev').open) loadDev() // keep an open dev panel in sync with the new turn
+  loadCost() // the turn spent money, refresh the tracker
   startIdleLoop() // idle animation from the moment the options are up
+}
+
+// update the top-left cost tracker from the state's cost payload
+function renderCost(cost) {
+  if (!cost) return
+  const fmt = n => `$${n.toFixed(2)}`
+  $('cost-llm').textContent = fmt(cost.llm)
+  $('cost-fal').textContent = fmt(cost.fal)
+  $('cost-total').textContent = fmt(cost.total)
+  $('cost').hidden = false
+}
+
+// fetch the running api spend and refresh the tracker
+async function loadCost() {
+  try { renderCost((await (await fetch('/api/state')).json()).cost) } catch {}
 }
 
 let devGen = 0 // bumped to invalidate stale dev panel fetches
@@ -201,6 +217,7 @@ function startIdleLoop() {
   const tick = async () => {
     try {
       const state = await (await fetch('/api/state')).json()
+      renderCost(state.cost) // free refresh while polling
       if (self.stopped || gen !== uiGen) return
       if (state.token !== self.token) return // the game advanced elsewhere, this loop is obsolete
       if (state.loopFailed) return // no loop this turn, the frame stands
@@ -280,6 +297,7 @@ async function resync(mustAdvancePast = null) {
     state = await (await fetch('/api/state')).json()
   }
   if (gen !== uiGen) return false // restarted meanwhile, drop this stale flow
+  renderCost(state.cost)
   if (!state.active) return false
   if (mustAdvancePast !== null && state.token === mustAdvancePast) return false
   const advanced = state.token !== currentToken
@@ -361,6 +379,7 @@ async function choose(index, labels) {
   if (gen !== uiGen) return
   // the server has advanced, from here on only the new choices may be shown
   setToken(data.token)
+  loadCost() // the turn's spend is final, don't wait out the clip to show it
   done() // hold the final generation time
   await playClip(data.clipUrl, data.frameUrl, data.choices) // waits out the current loop cycle itself
 }
