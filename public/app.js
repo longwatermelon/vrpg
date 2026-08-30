@@ -53,6 +53,31 @@ function renderChoices(labels) {
     btn.onclick = () => choose(i, labels)
     box.appendChild(btn)
   })
+  if ($('dev').open) loadDev() // keep an open dev panel in sync with the new turn
+}
+
+let devGen = 0 // bumped to invalidate stale dev panel fetches
+let devToken = null // turn token the panel currently shows, avoids duplicate fetches per turn
+
+// fill the dev panel with the llm-generated prompts behind the current turn
+async function loadDev(force = false) {
+  if (!force && devToken === currentToken) return // panel already shows this turn
+  const gen = ++devGen
+  const el = $('dev-body')
+  el.textContent = 'loading...'
+  try {
+    const d = await (await fetch('/api/debug')).json()
+    if (gen !== devGen) return // superseded, don't touch the panel
+    if (!d.active) return (el.textContent = 'no active game')
+    const parts = []
+    if (d.scenePrompt) parts.push(`[opening frame prompt]\n${d.scenePrompt}`)
+    if (d.clipPrompt) parts.push(`[current clip prompt]\n${d.clipPrompt}`)
+    d.choices.forEach((c, i) => parts.push(`[option ${i + 1}: ${c.label}]\n${c.prompt}`))
+    el.textContent = parts.join('\n\n')
+    devToken = d.token // cache under the server's token, another tab may have advanced the game
+  } catch (err) {
+    if (gen === devGen) el.textContent = `failed to load prompts: ${err.message}`
+  }
 }
 
 // disable or enable all choice buttons
@@ -64,6 +89,7 @@ function setChoicesDisabled(disabled) {
 async function playClip(clipUrl, frameUrl, choices) {
   const gen = ++playGen
   $('choices').innerHTML = ''
+  if ($('dev').open) loadDev() // the turn has advanced server-side, refresh an open dev panel now
   const video = $('player')
   video.src = clipUrl
   video.hidden = false
@@ -108,6 +134,9 @@ function stopMedia() {
 function toStartScreen() {
   uiGen++
   stopMedia()
+  devGen++ // drop any in-flight dev fetch and clear the old game's prompts
+  devToken = null
+  $('dev-body').textContent = ''
   $('choices').innerHTML = ''
   $('begin').disabled = false
   $('game-screen').hidden = true
@@ -245,6 +274,7 @@ async function restart() {
 
 $('begin').onclick = begin
 $('restart').onclick = restart
+$('dev').ontoggle = () => { if ($('dev').open) loadDev(true) } // always fetch fresh prompts on open
 
 // rejoin an active game after a page refresh
 async function init() {

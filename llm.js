@@ -28,8 +28,8 @@ const RESPONSE_FORMAT = {
   },
 }
 
-// call openrouter chat completions and return the assistant text
-async function complete(messages) {
+// call openrouter chat completions and return the assistant text, format is an optional response_format
+async function complete(messages, format) {
   const res = await fetch(API_URL, {
     method: 'POST',
     headers: {
@@ -39,8 +39,10 @@ async function complete(messages) {
     body: JSON.stringify({
       model: MODEL,
       messages,
-      response_format: RESPONSE_FORMAT,
-      provider: { require_parameters: true }, // only route to endpoints that honor the schema
+      ...(format && {
+        response_format: format,
+        provider: { require_parameters: true }, // only route to endpoints that honor the schema
+      }),
     }),
     signal: AbortSignal.timeout(3 * 60 * 1000), // don't hang the game on a stalled request
   })
@@ -51,6 +53,18 @@ async function complete(messages) {
   return text
 }
 
+const POV_RE = /^first-person pov shot\b/i // every prompt sent to the video/image models must open with this
+
+// true if text reads as camera language: right opener, no narrator pronouns outside <d> dialogue
+// or quoted diegetic text (signs, notes)
+// "mine" is deliberately not checked (doubles as a noun), "us" only lowercase so "the US" passes
+function isPov(text) {
+  const t = text.replace(/<d>.*?<\/d>/gs, '').replace(/"[^"]*"/g, '')
+  return POV_RE.test(text) &&
+    !/\b(i|me|my|myself|we|our|ours|ourselves|you|your|yours|yourself|yourselves)\b/i.test(t) &&
+    !/\bus\b/.test(t)
+}
+
 // parse and validate the choices json from raw llm output, null if invalid
 function parseChoices(raw) {
   const text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
@@ -58,7 +72,7 @@ function parseChoices(raw) {
     const choices = JSON.parse(text).choices
     if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
         choices.every(c => typeof c.label === 'string' && c.label.trim() &&
-                           typeof c.prompt === 'string' && c.prompt.trim())) {
+                           typeof c.prompt === 'string' && isPov(c.prompt.trim()))) {
       return choices
     }
   } catch {}
@@ -67,16 +81,36 @@ function parseChoices(raw) {
 
 // get the next set of choices from the llm, retrying once on bad json
 export async function chatChoices(messages) {
-  let raw = await complete(messages)
+  let raw = await complete(messages, RESPONSE_FORMAT)
   let choices = parseChoices(raw)
   if (!choices) { // one retry asking the llm to fix its format
     raw = await complete([
       ...messages,
       { role: 'assistant', content: raw },
-      { role: 'user', content: 'That response was not valid. Respond with only the JSON object in the required format.' },
-    ])
+      { role: 'user', content: 'That response was not valid. Respond with only the JSON object in the required format, with every prompt starting with "First-person POV shot" and using no first- or second-person pronouns outside dialogue.' },
+    ], RESPONSE_FORMAT)
     choices = parseChoices(raw)
     if (!choices) throw new Error('llm returned invalid choices json')
   }
   return { raw, choices }
+}
+
+const SCENE_SYSTEM = `You rewrite a player's narrative scene description into a prompt for an image generation model. The image must be a strict first-person POV shot seen through the narrator's eyes. Image models cannot do perspective-taking, so never refer to the narrator with pronouns: no "I", "me", "my", "you", or "we". Describe only what the camera sees: open with "First-person POV shot", have people who are looking at the narrator look into the camera (everyone else keeps their described gaze and pose), put nearby objects in the foreground, and mention the viewer's hands or body at the frame edge only when the scene implies them. Keep every concrete detail from the player's description and invent nothing important. Respond with only the rewritten prompt.`
+
+// rewrite the player's context into a first-person pov camera prompt for the image model, retrying once on a bad rewrite
+export async function rewriteScenePrompt(context) {
+  const messages = [
+    { role: 'system', content: SCENE_SYSTEM },
+    { role: 'user', content: context },
+  ]
+  let text = (await complete(messages)).trim()
+  if (!isPov(text)) { // one retry before sending a bad prompt to a paid job
+    text = (await complete([
+      ...messages,
+      { role: 'assistant', content: text },
+      { role: 'user', content: 'That response was not valid. Respond with only the rewritten prompt, starting with "First-person POV shot" and using no first- or second-person pronouns.' },
+    ])).trim()
+    if (!isPov(text)) throw new Error('llm returned a non-pov scene prompt')
+  }
+  return text
 }

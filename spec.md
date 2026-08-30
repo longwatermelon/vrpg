@@ -6,7 +6,7 @@ The story is text-first; it's essentially an LLM chat except the LLM responds wi
 
 ## Playthrough structure
 
-First, the player is greeted with a textbox in which they describe the basic context or starting point of the story. That context gets sent as the first user message in the LLM chat. Use an image model to generate the starting frame (Seedream 4.5 via Fal), which will be fed to the LLM as an attachment on the first user message.
+First, the player is greeted with a textbox in which they describe the basic context or starting point of the story. That context gets sent as the first user message in the LLM chat. A separate LLM call rewrites the context into first-person POV camera language (image models can't do perspective-taking from narrative "I" statements), and that rewritten prompt is used by an image model to generate the starting frame (Seedream 4.5 via Fal), which will be fed to the LLM as an attachment on the first user message.
 
 At this point, the player enters the main game loop, which consists of the following steps:
   * LLM generates 2-3 options for the player to take in the LLM chat as its response, formatted as json. Options displayed on screen.
@@ -24,17 +24,17 @@ So the user message is structured as `Choose option: <option label>\nAttached im
   "choices": [
     {
       "label": "Eat your girlfriend's sandwich",
-      "prompt": "You pick up the sandwich from the girl's plate and eat it. A crunch sound plays as the sandwich is consumed. She looks at you, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. In the end, the sandwich is completely gone from the girl's plate, the girl is looking annoyed at the camera, and the sandwich is fully consumed."
+      "prompt": "First-person POV shot seated at the restaurant table. The viewer's hand picks up the sandwich from the girl's plate and eats it. A crunch sound plays as the sandwich is consumed. She looks into the camera, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. In the end, the sandwich is completely gone from the girl's plate and she is looking annoyed into the camera."
     },
     {
       "label": "Get up and leave",
-      "prompt": "You stand up, turn around, and walk out of the restaurant. The girl looks confused and says <d>[English] Hey, where are you going!?</d>."
+      "prompt": "First-person POV shot rising from the restaurant table, the camera turning around and walking out of the restaurant. The girl looks confused and says <d>[English] Hey, where are you going!?</d>."
     }
   ]
 }
 ```
 
-Use start keyframe = current frozen frame, send prompt "First-person POV; you are the camera. `(prompt field)`" to video model along with start keyframe. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
+Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; the LLM is instructed to write every prompt in first-person POV camera language (starting with "First-person POV shot"), so nothing is prepended. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
 
 ## Models
 

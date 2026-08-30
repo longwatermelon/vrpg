@@ -16,7 +16,7 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, getState, resetGame } = await import('./game.js') // import after env is loaded
+const { startGame, chooseOption, getState, getDebug, resetGame } = await import('./game.js') // import after env is loaded
 
 const MIME = {
   '.html': 'text/html',
@@ -124,6 +124,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(res, 200, getState())
+    }
+    if (req.method === 'GET' && url.pathname === '/api/debug') {
+      return sendJson(res, 200, getDebug())
     }
     // static files: /data/* from the session data dir, everything else from public/
     const pathname = decodeURIComponent(url.pathname)

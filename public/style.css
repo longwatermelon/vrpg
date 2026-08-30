@@ -78,6 +78,18 @@ button:disabled { opacity: 0.5; cursor: default; }
   gap: 8px;
 }
 
+#dev { color: #9a9aad; font-size: 0.85em; }
+#dev summary { cursor: pointer; }
+#dev pre {
+  white-space: pre-wrap;
+  background: #1a1a20;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 10px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
 #restart {
   align-self: center;
   padding: 6px 12px;
