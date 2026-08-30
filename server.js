@@ -90,8 +90,9 @@ function serveFile(req, res, filePath) {
 }
 
 // reject cross-origin browser requests, the api triggers paid model calls
+// localhost plus this machine's tailnet names, so other tailscale devices can play
 function isLocalRequest(req) {
-  const local = h => /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(h)
+  const local = h => /^(localhost|127\.0\.0\.1|100\.64\.148\.71|smint\.taila3ad62\.ts\.net)(:\d+)?$/.test(h)
   const origin = req.headers.origin
   if (origin && !local(origin.replace(/^https?:\/\//, ''))) return false
   return local(req.headers.host || '')

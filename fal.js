@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 
 const ENDPOINT = 'https://queue.fal.run/minimax/h3-max/image-to-video'
-const POLL_MS = 3000
+const POLL_MS = 750
 const TIMEOUT_MS = 10 * 60 * 1000
 
 const headers = { Authorization: `Key ${process.env.FAL_API_KEY}`, 'Content-Type': 'application/json' }
@@ -18,7 +18,7 @@ export async function submitJob(prompt, imageDataUri) {
       image_url: imageDataUri,
       duration: 5,
       resolution: '480P',
-      prompt_expansion_mode: 'balanced',
+      prompt_expansion_mode: 'off',
     }),
   })
   if (!submit.ok) throw new Error(`fal submit failed: ${submit.status} ${await submit.text()}`)
