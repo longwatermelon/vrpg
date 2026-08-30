@@ -2,8 +2,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chatChoices } from './llm.js'
-import { submitJob, awaitJob } from './fal.js'
-import { extractLastFrame, generateInitialImage } from './media.js'
+import { submitJob, awaitJob, submitImageJob, awaitImageJob } from './fal.js'
+import { extractLastFrame } from './media.js'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(ROOT, 'data')
@@ -106,16 +106,22 @@ export function getState() {
 // start a new game from the player's context, returns the opening frame and choices
 export function startGame(context) {
   return exclusive(async () => {
-    // reuse an already generated opening frame if this is a retry of the same start
-    let dir, frame
-    if (pendingStart?.context === context) {
-      ({ dir, frame } = pendingStart)
-    } else {
-      dir = path.join(DATA_DIR, String(Date.now()))
+    // reuse the submitted job or finished opening frame if this is a retry of the same start
+    if (pendingStart?.context !== context) {
+      const dir = path.join(DATA_DIR, String(Date.now()))
       fs.mkdirSync(dir, { recursive: true })
-      frame = await generateInitialImage(context, path.join(dir, 'frame-0'))
-      pendingStart = { context, dir, frame }
+      pendingStart = { context, dir, job: await submitImageJob(`Strictly FIRST-PERSON POV shot: the viewer IS the camera, seen through their own eyes. The person described below is the one holding the viewpoint and must NOT appear as a separate character in the scene (at most their own hands or body edges at the frame border). Opening frame for this starting context: ${context}`) }
     }
+    const { dir } = pendingStart
+    if (!pendingStart.frame) {
+      try {
+        pendingStart.frame = await awaitImageJob(pendingStart.job, path.join(dir, 'frame-0'))
+      } catch (err) {
+        if (err.terminal) pendingStart = null // job itself failed, a retry must resubmit
+        throw err
+      }
+    }
+    const frame = pendingStart.frame
     const candidate = { dir, turn: 0, frame, messages: [{ role: 'system', content: SYSTEM_PROMPT }], choices: [] }
     const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
     commitTurn(candidate, turn, frame, 0)

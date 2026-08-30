@@ -6,7 +6,7 @@ The story is text-first; it's essentially an LLM chat except the LLM responds wi
 
 ## Playthrough structure
 
-First, the player is greeted with a textbox in which they describe the basic context or starting point of the story. That context gets sent as the first user message in the LLM chat. Use an image model to generate the starting frame (tbd which one), which will be fed to the LLM as an attachment on the first user message.
+First, the player is greeted with a textbox in which they describe the basic context or starting point of the story. That context gets sent as the first user message in the LLM chat. Use an image model to generate the starting frame (Seedream 4.5 via Fal), which will be fed to the LLM as an attachment on the first user message.
 
 At this point, the player enters the main game loop, which consists of the following steps:
   * LLM generates 2-3 options for the player to take in the LLM chat as its response, formatted as json. Options displayed on screen.
@@ -41,5 +41,7 @@ Use start keyframe = current frozen frame, send prompt "First-person POV; you ar
 LLM: accessed via OpenRouter.
 
 Video model: Minimax H3 Max (via Fal AI).
-  * 480p with `balanced` prompt expansion mode
+  * 480p with `disabled` prompt expansion mode
+
+Starting frame image model: Bytedance Seedream 4.5 (via Fal AI).
 
