@@ -16,7 +16,7 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory } = await import('./game.js') // import after env is loaded
+const { startGame, chooseOption, chooseCustom, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory } = await import('./game.js') // import after env is loaded
 
 const MIME = {
   '.html': 'text/html',
@@ -125,6 +125,27 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/choose') {
       const { index, token } = await readJson(req)
       return sendJson(res, 200, await chooseOption(index, token))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/choose-custom') {
+      const { text, token } = await readJson(req)
+      if (typeof text !== 'string' || !text.trim()) return sendJson(res, 400, { error: 'text is required' })
+      if (text.length > 300) return sendJson(res, 400, { error: 'idea too long, keep it under 300 characters' })
+      return sendJson(res, 200, await chooseCustom(text.trim(), token))
+    }
+    if (req.method === 'GET' && url.pathname === '/api/timeline') {
+      return sendJson(res, 200, getTimeline())
+    }
+    if (req.method === 'POST' && url.pathname === '/api/seek') {
+      const { turn, token } = await readJson(req)
+      return sendJson(res, 200, await seekTurn(turn, token))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/continue') {
+      const { token } = await readJson(req)
+      return sendJson(res, 200, await continueStory(token))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/truncate') {
+      const { turn, token } = await readJson(req)
+      return sendJson(res, 200, await truncateStory(turn, token))
     }
     if (req.method === 'POST' && url.pathname === '/api/reset') {
       await readJson(req) // drain the body

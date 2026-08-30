@@ -35,19 +35,31 @@
       <video id="player-b" hidden playsinline preload="auto"></video>
     </div>
     <div id="status" hidden></div>
-    <!-- cost tracker: running api spend, top left -->
-    <div id="cost" hidden>
-      <span>llm</span><span class="amt" id="cost-llm"></span>
-      <span>fal</span><span class="amt" id="cost-fal"></span>
-      <span>total</span><span class="amt" id="cost-total"></span>
-    </div>
+    <!-- timeline toggle, top left -->
+    <button id="timeline-toggle">Timeline</button>
     <div id="choices"></div>
     <!-- dev panel: shows the llm-generated prompts behind the current turn -->
     <details id="dev">
       <summary>Dev: prompts</summary>
       <pre id="dev-body"></pre>
     </details>
-    <button id="restart">Restart</button>
+    <!-- timeline sidebar: every turn of the story, rewind and prune; cost + restart live at its bottom -->
+    <div id="sidebar" hidden>
+      <div id="sidebar-head">
+        <span>Timeline</span>
+        <button id="sidebar-close" aria-label="close timeline">&times;</button>
+      </div>
+      <div id="timeline"></div>
+      <div id="sidebar-bottom">
+        <!-- cost tracker: running api spend -->
+        <div id="cost" hidden>
+          <span>llm</span><span class="amt" id="cost-llm"></span>
+          <span>fal</span><span class="amt" id="cost-fal"></span>
+          <span>total</span><span class="amt" id="cost-total"></span>
+        </div>
+        <button id="restart">Restart</button>
+      </div>
+    </div>
   </div>
 
   <script src="/app.js"></script>

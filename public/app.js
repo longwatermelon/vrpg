@@ -79,8 +79,17 @@ function showFrame(url) {
   video.hidden = true
 }
 
-// render the choice buttons for the current turn
-function renderChoices(labels) {
+// shared per-turn ui refresh: dev panel, cost tracker, idle loop, timeline
+function turnUiTail() {
+  if ($('dev').open) loadDev() // keep an open dev panel in sync with the new turn
+  loadCost() // the turn may have spent money, refresh the tracker
+  startIdleLoop() // idle animation from the moment the options are up
+  refreshTimeline() // keep an open sidebar in sync with the new position
+}
+
+// render the choice buttons plus the write-your-own box for the current turn
+// idea prefills the box, so a failed custom action can be retried without retyping
+function renderChoices(labels, idea = '') {
   const box = $('choices')
   box.innerHTML = ''
   labels.forEach((label, i) => {
@@ -89,12 +98,42 @@ function renderChoices(labels) {
     btn.onclick = () => choose(i, labels)
     box.appendChild(btn)
   })
-  if ($('dev').open) loadDev() // keep an open dev panel in sync with the new turn
-  loadCost() // the turn spent money, refresh the tracker
-  startIdleLoop() // idle animation from the moment the options are up
+  // fourth box: the player writes their own idea, the llm turns it into a real action
+  const wrap = document.createElement('div')
+  wrap.className = 'custom-choice'
+  const input = document.createElement('input')
+  input.maxLength = 300
+  input.placeholder = 'Or write your own idea...'
+  input.value = idea
+  const go = document.createElement('button')
+  go.textContent = 'Go'
+  const submit = () => { if (input.value.trim()) chooseCustom(input.value.trim(), labels) }
+  go.onclick = submit
+  input.onkeydown = e => { if (e.key === 'Enter') submit() }
+  wrap.append(input, go)
+  box.appendChild(wrap)
+  turnUiTail()
 }
 
-// update the top-left cost tracker from the state's cost payload
+// render the single continue button shown while browsing past turns
+function renderContinue() {
+  const box = $('choices')
+  box.innerHTML = ''
+  const btn = document.createElement('button')
+  btn.className = 'continue'
+  btn.textContent = 'Continue'
+  btn.onclick = () => continueStory()
+  box.appendChild(btn)
+  turnUiTail()
+}
+
+// choices at the tip of the timeline, a bare continue while browsing history
+function renderTurnUi(labels, mode, idea = '') {
+  if (mode === 'continue') renderContinue()
+  else renderChoices(labels, idea)
+}
+
+// update the sidebar cost tracker from the state's cost payload
 function renderCost(cost) {
   if (!cost) return
   const fmt = n => `$${n.toFixed(2)}`
@@ -134,13 +173,14 @@ async function loadDev(force = false) {
   }
 }
 
-// disable or enable all choice buttons
+// disable or enable all choice buttons and the custom idea box
 function setChoicesDisabled(disabled) {
-  for (const btn of $('choices').children) btn.disabled = disabled
+  for (const el of $('choices').querySelectorAll('button, input')) el.disabled = disabled
 }
 
-// play a clip and show the given choices when it ends
-async function playClip(clipUrl, frameUrl, choices) {
+// play a clip and show the given choices (or a continue button) when it ends
+// idea prefills the custom box afterward, a pending custom action must survive playback
+async function playClip(clipUrl, frameUrl, choices, mode = 'choices', idea = '') {
   const ui = uiGen
   if (loop && !loop.playing) loop.stop() // a loop that never made it on stage is stale, free its standby element
   new Image().src = frameUrl // warm the browser cache off-screen, fallbacks may need the outcome frame instantly
@@ -165,7 +205,7 @@ async function playClip(clipUrl, frameUrl, choices) {
     standby.removeAttribute('src')
     setStatus('Clip playback failed, showing its final frame', true)
     showFrame(frameUrl)
-    renderChoices(choices)
+    renderTurnUi(choices, mode, idea)
     return
   }
   swapPlayers()
@@ -175,9 +215,9 @@ async function playClip(clipUrl, frameUrl, choices) {
     if (gen !== playGen) return // superseded, don't touch the ui
     setStatus('Clip playback failed, showing its final frame', true)
     showFrame(frameUrl)
-    renderChoices(choices)
+    renderTurnUi(choices, mode, idea)
   }
-  v.onended = () => { if (gen === playGen) renderChoices(choices) } // video pauses on its last frame
+  v.onended = () => { if (gen === playGen) renderTurnUi(choices, mode, idea) } // video pauses on its last frame
   v.onerror = fallback
   try {
     await v.play()
@@ -302,6 +342,7 @@ function toStartScreen() {
   devToken = null
   $('dev-body').textContent = ''
   $('choices').innerHTML = ''
+  $('sidebar').hidden = true // close the timeline with the game it belongs to
   $('begin').disabled = false
   $('game-screen').hidden = true
   $('start-screen').hidden = false
@@ -442,11 +483,9 @@ async function resync(mustAdvancePast = null) {
   $('game-screen').hidden = false
   setStatus('Recovered current game state') // replace any stale progress or error text
   if (advanced && state.clipUrl && !state.loadedClip) {
-    await playClip(state.clipUrl, state.frameUrl, state.choices) // the missed clip
+    await playClip(state.clipUrl, state.frameUrl, state.choices, state.mode, state.pendingIdea || '') // the missed clip
   } else {
-    // stage the frame hidden, the idle loop takes the stage (ensureStage reveals the frame if it can't)
-    $('frame').src = state.frameUrl
-    renderChoices(state.choices)
+    showPosition(state) // reset the stage like a seek, an old video must not stay up
   }
   return true
 }
@@ -493,19 +532,34 @@ async function begin() {
   renderChoices(data.choices)
 }
 
-// pick a choice, render the clip, play it, then show the next choices
-async function choose(index, labels) {
+let opBusy = false // one turn or timeline request at a time client-side, their recovery flows must not interleave
+
+// run a turn-advancing api call with ambiguous-failure recovery, then play the resulting clip
+// restore re-renders the pre-call ui when the server provably did not advance
+async function advanceTurn(label, request, restore) {
+  if (opBusy) return
+  opBusy = true
+  try {
+    await advanceTurnInner(label, request, restore)
+  } finally {
+    opBusy = false
+  }
+}
+
+// body of advanceTurn, wrapped so the busy flag always releases
+async function advanceTurnInner(label, request, restore) {
   const gen = uiGen
   setChoicesDisabled(true)
-  const done = startTimer('Rendering clip...')
+  const done = label ? startTimer(label) : () => setStatus('') // instant actions get no timer
   let data
   try {
-    data = await api('/api/choose', { index, token: currentToken }) // the idle loop keeps playing meanwhile
+    data = await request() // the idle loop keeps playing meanwhile
   } catch (err) {
     if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
     // the failure may be ambiguous, recover only if the server actually advanced;
     // keep probing until the server gives a conclusive answer
     setStatus(err.message, true)
+    let settled = null // last state fetch once the server settles without advancing
     for (;;) {
       try {
         if (await resync(currentToken)) return
@@ -513,7 +567,8 @@ async function choose(index, labels) {
         // the game may have been reset from another tab, return to the start screen
         const state = await (await fetch('/api/state')).json()
         if (!state.active) return toStartScreen()
-        break // settled without advancing, the choice really failed
+        settled = state
+        break // settled without advancing, the request really failed
       } catch {
         if (gen !== uiGen) return
         await new Promise(r => setTimeout(r, 3000)) // server unreachable, try again
@@ -521,15 +576,38 @@ async function choose(index, labels) {
     }
     if (gen !== uiGen) return
     setStatus(err.message, true) // resync's progress text may have replaced the error
-    renderChoices(labels) // server did not advance, the old choices and error stand
+    restore(settled?.pendingIdea) // server did not advance, the old ui and error stand; a pending idea wins the box
     return
   }
   if (gen !== uiGen) return
-  // the server has advanced, from here on only the new choices may be shown
+  // the server has advanced, from here on only the new state may be shown
   setToken(data.token)
   loadCost() // the turn's spend is final, don't wait out the clip to show it
   done() // hold the final generation time
-  await playClip(data.clipUrl, data.frameUrl, data.choices) // waits out the current loop cycle itself
+  await playClip(data.clipUrl, data.frameUrl, data.choices, data.mode, data.pendingIdea || '') // waits out the current loop cycle itself
+}
+
+// pick a choice, render the clip, play it, then show the next choices
+function choose(index, labels) {
+  const idea = $('choices').querySelector('.custom-choice input')?.value || '' // keep a half-typed idea across a failure
+  return advanceTurn('Rendering clip...',
+    () => api('/api/choose', { index, token: currentToken }),
+    pendingIdea => renderChoices(labels, pendingIdea ?? idea))
+}
+
+// send the player's own idea, the llm writes an action from it, then render and play it
+function chooseCustom(text, labels) {
+  return advanceTurn('Writing your action and rendering clip...',
+    () => api('/api/choose-custom', { text, token: currentToken }),
+    // keep the idea in the box, a retry must resend the same text; a differing server-pending idea wins
+    pendingIdea => renderChoices(labels, pendingIdea ?? text))
+}
+
+// replay the next canonical clip while browsing history, already rendered so no timer
+function continueStory() {
+  return advanceTurn(null,
+    () => api('/api/continue', { token: currentToken }),
+    () => renderContinue())
 }
 
 // end the current game server-side and return to the start screen
@@ -565,8 +643,121 @@ async function restart() {
   $('character').value = ''
 }
 
+let timelineGen = 0 // bumped per fetch so only the latest timeline render wins
+
+// open or close the timeline sidebar, fetching fresh points on open
+function toggleSidebar(open) {
+  const sb = $('sidebar')
+  sb.hidden = open === undefined ? !sb.hidden : !open
+  if (!sb.hidden) loadTimeline()
+}
+
+// refresh the timeline if the sidebar is open
+function refreshTimeline() {
+  if (!$('sidebar').hidden) loadTimeline()
+}
+
+// fetch the timeline and render one point per turn, current position highlighted
+async function loadTimeline() {
+  const gen = ++timelineGen
+  let data = null
+  try { data = await (await fetch('/api/timeline')).json() } catch {}
+  if (gen !== timelineGen || $('sidebar').hidden) return // superseded or closed meanwhile
+  const box = $('timeline')
+  box.innerHTML = ''
+  if (!data?.active) return
+  for (const p of data.points) {
+    const el = document.createElement('div')
+    el.className = 'tl-point' + (p.turn === data.pos ? ' current' : '')
+    const main = document.createElement('button') // real button, the timeline works by keyboard too
+    main.type = 'button'
+    main.className = 'tl-main'
+    const img = document.createElement('img')
+    if (p.frameUrl) img.src = p.frameUrl
+    img.alt = `turn ${p.turn + 1}`
+    img.loading = 'lazy'
+    const info = document.createElement('div')
+    info.className = 'tl-info'
+    const num = document.createElement('div')
+    num.className = 'tl-turn'
+    num.textContent = `Turn ${p.turn + 1}${p.turn === data.turn ? ' · latest' : ''}`
+    const label = document.createElement('div')
+    label.className = 'tl-label'
+    label.textContent = p.label || (p.turn === data.turn ? 'Awaiting your choice' : '')
+    info.append(num, label)
+    main.append(img, info)
+    main.disabled = p.turn === data.pos // already here, nothing to seek to
+    main.onclick = () => seekTo(p.turn)
+    el.appendChild(main)
+    if (p.turn !== data.turn) { // the tip has nothing after it to delete
+      const del = document.createElement('button')
+      del.type = 'button'
+      del.className = 'tl-del'
+      del.textContent = '✂'
+      del.title = 'Delete everything after this point'
+      del.onclick = () => truncateTo(p.turn)
+      el.appendChild(del)
+    }
+    box.appendChild(el)
+  }
+  box.querySelector('.current')?.scrollIntoView({ block: 'nearest' }) // keep the current point in view
+}
+
+// put a seeked or resynced position on stage: frozen frame first, its idle loop takes over
+function showPosition(data) {
+  uiGen++ // supersede any in-flight playback flow so a stale clip can't retake the stage
+  stopMedia()
+  showFrame(data.frameUrl)
+  renderTurnUi(data.choices, data.mode, data.pendingIdea || '') // a pending custom idea goes back in the box
+}
+
+// jump the timeline via a seek or truncate call, recovering if the response is lost
+async function timelineJump(path, body) {
+  if (opBusy) return setStatus('Another action is in progress, wait for it to finish', true)
+  opBusy = true
+  try {
+    await timelineJumpInner(path, body)
+  } finally {
+    opBusy = false
+  }
+}
+
+// body of timelineJump, wrapped so the busy flag always releases
+async function timelineJumpInner(path, body) {
+  const gen = uiGen
+  try {
+    const data = await api(path, body)
+    if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
+    setToken(data.token)
+    setStatus('')
+    showPosition(data)
+  } catch (err) {
+    if (gen !== uiGen) return
+    setStatus(err.message, true)
+    // the server may have moved with only the response lost, recover if it advanced
+    try {
+      if (await resync(currentToken)) return
+    } catch {}
+    if (gen !== uiGen) return
+    setStatus(err.message, true) // resync's progress text may have replaced the error
+  }
+}
+
+// jump the game to a turn on the timeline
+function seekTo(turn) {
+  return timelineJump('/api/seek', { turn, token: currentToken })
+}
+
+// delete every turn after this one and land on it with its choices live again
+function truncateTo(turn) {
+  if (!confirm('Delete everything after this point? Those turns are removed permanently.')) return
+  return timelineJump('/api/truncate', { turn, token: currentToken })
+}
+
 $('begin').onclick = begin
 $('restart').onclick = restart
+$('timeline-toggle').onclick = () => toggleSidebar()
+$('sidebar-close').onclick = () => toggleSidebar(false)
 $('dev').ontoggle = () => { if ($('dev').open) loadDev(true) } // always fetch fresh prompts on open
 
 // rejoin an active game after a page refresh

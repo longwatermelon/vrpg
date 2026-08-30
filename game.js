@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chatChoices, startScene, getLlmCost } from './llm.js'
+import { chatChoices, startScene, customChoice, parseChoices, getLlmCost } from './llm.js'
 import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob, getFalCost } from './fal.js'
 import { extractLastFrame, concatClips } from './media.js'
 
@@ -29,6 +29,8 @@ Loops may also be action scenes, not just idle rote actions; as long as it's nat
 
 The loop must not perform any of the choices or advance the story. Like "prompt", it must be self-contained.
 
+Exception: sometimes a user message will instead ask you to turn the player's own typed idea into a single choice. Respond then with ONLY one choice object {"label": "...", "prompt": "...", "duration": 8} following the same field rules, no "choices" array and no "loop-prompt".
+
 Make the story interesting and fun; be creative. Keep the story progressing - pace it properly. Not too slow, not too fast. If the scene is starting to lull / there's no particularly interesting options left, make the third option be something that cuts away from the current scene and skips to later in a different setting and time and context.
 
 Example response (player character: a tall young man with short brown hair in a gray hoodie; frame: him at dinner with his girlfriend, a sandwich on her plate - labels may use story knowledge, prompts may not):
@@ -44,6 +46,8 @@ let pendingStart = null // finished opening frame awaiting a successful llm turn
 let resetInFlight = null // dedupes overlapping resets and blocks new game ops from overtaking one
 
 let idleLoop = null // this turn's 5s idle loop render, best-effort
+
+let navClip = null // clip replayed by the last continue, keyed by token, so a lost response can still replay it
 
 // forget the current idle loop, best-effort canceling a still-running render
 function dropIdleLoop() {
@@ -92,9 +96,11 @@ function toDataUri(file) {
   return `data:${mime};base64,${fs.readFileSync(file).toString('base64')}`
 }
 
-// convert an absolute path under data/ into a servable url
+// convert an absolute path under data/ into a servable url, versioned by mtime
+// so the browser's long-lived media cache can never serve a deleted branch's file recreated under the same name
 function toUrl(file) {
-  return '/' + path.relative(ROOT, file).split(path.sep).join('/')
+  const rel = '/' + path.relative(ROOT, file).split(path.sep).join('/')
+  try { return `${rel}?v=${Math.trunc(fs.statSync(file).mtimeMs)}` } catch { return rel }
 }
 
 // ask the llm for the next choices given a user message with a frame attached, no mutation of s
@@ -144,6 +150,37 @@ function applyTurn(s, { msgs, choices, loopPrompt }, frame, turn) {
   s.loopPrompt = loopPrompt
   s.frame = frame
   s.turn = turn
+  s.pos = turn // a fresh turn always lands at the tip of the timeline
+}
+
+// locate the frame image for a turn on disk, any known extension
+function findFrame(dir, n) {
+  for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
+    const f = path.join(dir, `frame-${n}${ext}`)
+    if (fs.existsSync(f)) return f
+  }
+  return null
+}
+
+// point the idle loop at an already-rendered loop file on disk, if present
+function setDiskLoop(dir, turnNo) {
+  dropIdleLoop()
+  const f = path.join(dir, `loop-${turnNo}.mp4`)
+  if (fs.existsSync(f)) idleLoop = { token, url: toUrl(f) }
+  else idleLoop = { token, failed: true } // no loop for this frame, the static frame stands
+}
+
+// client view of the current timeline position: live choices at the tip, a bare continue while browsing
+function positionState(s) {
+  const atTip = s.pos === s.turn
+  const frame = atTip ? s.frame : findFrame(s.dir, s.pos) || s.frame
+  return {
+    frameUrl: toUrl(frame),
+    mode: atTip ? 'choices' : 'continue',
+    choices: atTip ? s.choices.map(c => c.label) : [],
+    // text of a pending custom action, so the client can put it back in the box for the retry
+    pendingIdea: pendingRender?.token === token && typeof pendingRender.key === 'string' ? pendingRender.key.slice('custom:'.length) : null,
+  }
 }
 
 // running api spend for this process, exact for openrouter, rate-estimated for fal
@@ -161,27 +198,31 @@ export function getState() {
     active: true,
     busy: settling,
     token,
-    frameUrl: toUrl(session.frame),
-    clipUrl: session.clip ? toUrl(session.clip) : null,
-    loadedClip: !!(session.clip && session.loaded), // historical clip of a resumed story, not a missed turn
+    ...positionState(session), // frameUrl, mode, choices for the current position
+    // a just-continued clip replays even off-tip, otherwise clip replay only makes sense at the tip
+    clipUrl: (navClip?.token === token ? navClip.url : null) ||
+      (session.pos === session.turn && session.clip ? toUrl(session.clip) : null),
+    loadedClip: navClip?.token === token ? false : !!(session.clip && session.loaded), // historical clip of a resumed story, not a missed turn
     loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
     loopFailed: idleLoop?.token === token ? !!idleLoop.failed : true, // no loop entry means none is coming, stop waiting
-    choices: session.choices.map(c => c.label),
     cost: getCost(),
   }
 }
 
-// prompts behind the current turn for the dev panel
+// prompts behind the current position for the dev panel
 export function getDebug() {
   if (!session) return { active: false }
+  const atTip = session.pos === session.turn
+  // at a historical position the prompts come from that turn's saved assistant message
+  const parsed = atTip ? null : parseChoices(session.messages[2 + 2 * session.pos]?.content || '')
   return {
     active: true,
     token,
     scenePrompt: session.scenePrompt,
-    clipPrompt: session.clipPrompt || null,
-    clipDuration: session.clipDuration || null,
-    loopPrompt: session.loopPrompt || null,
-    choices: session.choices,
+    clipPrompt: atTip ? session.clipPrompt || null : null, // a historical clip's prompt isn't tracked
+    clipDuration: atTip ? session.clipDuration || null : null,
+    loopPrompt: atTip ? session.loopPrompt || null : parsed?.loopPrompt || null,
+    choices: atTip ? session.choices : parsed?.choices || [],
   }
 }
 
@@ -231,57 +272,204 @@ export function resetGame() {
       session = null
       pendingStart = null
       pendingRender = null
+      navClip = null
       dropIdleLoop() // the turn that was in flight may have started another one meanwhile
     }, true).finally(() => { resetInFlight = null })
   }
   return resetInFlight
 }
 
+// common guards for advancing the story with a new choice
+function checkAtTip(clientToken) {
+  if (!session) throw new Error('no active game')
+  if (clientToken !== token) throw new Error('stale turn, the game has already advanced')
+  if (session.pos !== session.turn) throw new Error('not at the end of the timeline, continue or delete forward history first')
+}
+
+// render the picked choice's clip, run the llm turn, and commit; shared by preset and custom picks
+// expects pendingRender to hold the submitted job for this choice
+async function commitChoice(choice, custom) {
+  const clip = path.join(session.dir, `clip-${session.turn}.mp4`)
+  const frame = path.join(session.dir, `frame-${session.turn + 1}.jpg`)
+  if (!pendingRender.done) {
+    try {
+      await awaitJob(pendingRender.job, clip)
+    } catch (err) {
+      if (err.terminal) pendingRender.job = null // job itself failed, a retry resubmits it but keeps the choice
+      throw err
+    }
+    await extractLastFrame(clip, frame)
+    pendingRender.done = true
+  }
+  // a custom choice's prompt lives nowhere in the transcript, so carry it in the user message;
+  // preset prompts are already in the preceding assistant message
+  const text = custom
+    ? `Choose custom action: ${choice.label}\nThe action was rendered from this clip prompt: ${choice.prompt}\nAttached image is the last frame of where this chosen action left off.`
+    : `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`
+  const next = await nextTurn(session, text, frame)
+  // stage the committed state on a copy and persist it before publishing in memory,
+  // so a failed disk save leaves the turn cleanly retryable
+  const committed = { ...session }
+  applyTurn(committed, next, frame, session.turn + 1)
+  committed.loaded = false // this clip is newly committed, resync may replay it
+  committed.clip = clip
+  committed.clipPrompt = choice.prompt
+  committed.clipDuration = choice.duration
+  saveSession(committed)
+  session = committed
+  token++
+  // hold the turn until the new frame's idle loop is also rendered, so the loop is
+  // guaranteed ready the moment the clip ends and the handoff stays seamless,
+  // waiting in short slices so a queued reset isn't stuck behind a cosmetic render
+  const loopReady = startIdleLoopRender(session, token).then(() => true)
+  while (!(await Promise.race([loopReady, new Promise(r => setTimeout(r, 500))])) && !resetInFlight) {}
+  pendingRender = null
+  return { clipUrl: toUrl(clip), frameUrl: toUrl(frame), choices: next.choices.map(c => c.label), mode: 'choices', token }
+}
+
 // advance the game with the chosen option, returns the rendered clip and next choices
 export function chooseOption(index, clientToken) {
   return exclusive(async () => {
-    if (!session) throw new Error('no active game')
-    if (clientToken !== token) throw new Error('stale turn, the game has already advanced')
+    checkAtTip(clientToken)
     if (!Number.isInteger(index) || !session.choices[index]) throw new Error('invalid choice index')
     const choice = session.choices[index]
-    const clip = path.join(session.dir, `clip-${session.turn}.mp4`)
-    const frame = path.join(session.dir, `frame-${session.turn + 1}.jpg`)
-    // reuse the submitted job or finished render on retry instead of paying for another
-    if (pendingRender?.token === token && pendingRender.index !== index) {
-      throw new Error(`a render for "${session.choices[pendingRender.index].label}" is already pending, retry that choice`)
+    // reuse the submitted job or finished render on retry instead of paying for another;
+    // a job-less entry is a terminal render failure, any other choice may replace it
+    if (pendingRender?.token === token && pendingRender.key !== index && pendingRender.job) {
+      throw new Error(`a render for "${pendingRender.choice.label}" is already pending, retry that choice`)
     }
-    if (pendingRender?.token !== token) {
-      pendingRender = { token, index, job: await submitJob(choice.prompt, toDataUri(session.frame), choice.duration), done: false }
+    if (pendingRender?.token !== token || pendingRender.key !== index) pendingRender = { token, key: index, choice, done: false }
+    if (!pendingRender.job) pendingRender.job = await submitJob(choice.prompt, toDataUri(session.frame), choice.duration)
+    return commitChoice(pendingRender.choice, false)
+  })
+}
+
+// advance the game with a choice the llm writes from the player's own idea
+export function chooseCustom(text, clientToken) {
+  return exclusive(async () => {
+    checkAtTip(clientToken)
+    const key = `custom:${text}`
+    // reuse the generated choice and submitted job on retry instead of paying again;
+    // a job-less entry is a terminal render failure, any other choice may replace it
+    if (pendingRender?.token === token && pendingRender.key !== key && pendingRender.job) {
+      throw new Error(`a render for "${pendingRender.choice.label}" is already pending, retry that choice`)
     }
-    if (!pendingRender.done) {
-      try {
-        await awaitJob(pendingRender.job, clip)
-      } catch (err) {
-        if (err.terminal) pendingRender = null // job itself failed, a retry must resubmit
-        throw err
-      }
-      await extractLastFrame(clip, frame)
-      pendingRender.done = true
+    if (pendingRender?.token !== token || pendingRender.key !== key) {
+      // the llm takes inspiration from the idea and writes a proper self-contained choice,
+      // cached before the render submit so a submit failure never repeats the paid llm call
+      const choice = await customChoice(session.messages.map(stripImage), text, toDataUri(session.frame))
+      pendingRender = { token, key, choice, done: false }
     }
-    const next = await nextTurn(session, `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`, frame)
-    // stage the committed state on a copy and persist it before publishing in memory,
-    // so a failed disk save leaves the turn cleanly retryable
+    if (!pendingRender.job) pendingRender.job = await submitJob(pendingRender.choice.prompt, toDataUri(session.frame), pendingRender.choice.duration)
+    return commitChoice(pendingRender.choice, true)
+  })
+}
+
+// label of the choice taken at a turn, parsed from the following user message
+function chosenLabel(s, k) {
+  const m = s.messages[3 + 2 * k] // [system, user0, asst0, user1, ...], user k+1 holds turn k's pick
+  const text = Array.isArray(m?.content) ? m.content.find(p => p.type === 'text')?.text : m?.content
+  const match = typeof text === 'string' ? text.match(/^Choose (?:custom action|option): (.*)/) : null
+  return match ? match[1] : null
+}
+
+// timeline of the active story: one point per turn with its frame and the choice taken there
+export function getTimeline() {
+  if (!session) return { active: false }
+  const points = []
+  for (let k = 0; k <= session.turn; k++) {
+    const frame = findFrame(session.dir, k)
+    points.push({ turn: k, frameUrl: frame ? toUrl(frame) : null, label: chosenLabel(session, k) })
+  }
+  return { active: true, token, pos: session.pos, turn: session.turn, points }
+}
+
+// move the viewing position to a turn on the timeline without changing history
+export function seekTurn(turnNo, clientToken) {
+  return exclusive(async () => {
+    if (!session) throw new Error('no active game')
+    if (clientToken !== token) throw new Error('stale turn, the game has already advanced')
+    if (!Number.isInteger(turnNo) || turnNo < 0 || turnNo > session.turn) throw new Error('invalid turn')
+    if (turnNo !== session.turn && !findFrame(session.dir, turnNo)) throw new Error('frame missing on disk for that turn')
+    session.pos = turnNo
+    session.loaded = true // navigation makes the tip clip historical, a lost-response resync must not replay it
+    retagPending(token + 1) // the tip's paid pending render must survive browsing
+    token++
+    setDiskLoop(session.dir, turnNo)
+    return { ...positionState(session), token }
+  })
+}
+
+// carry a current pending render across a token bump, pure position changes must not strand a paid job
+function retagPending(newToken) {
+  if (pendingRender?.token === token) pendingRender.token = newToken
+}
+
+// step one turn forward along the already-rendered canonical timeline, free
+export function continueStory(clientToken) {
+  return exclusive(async () => {
+    if (!session) throw new Error('no active game')
+    if (clientToken !== token) throw new Error('stale turn, the game has already advanced')
+    if (session.pos >= session.turn) throw new Error('already at the end of the timeline')
+    const clip = path.join(session.dir, `clip-${session.pos}.mp4`)
+    if (!fs.existsSync(clip)) throw new Error('clip missing on disk')
+    if (session.pos + 1 !== session.turn && !findFrame(session.dir, session.pos + 1)) throw new Error('frame missing on disk for that turn')
+    session.pos++
+    session.loaded = true // navigation makes the tip clip historical, a lost-response resync must not replay it
+    retagPending(token + 1) // the tip's paid pending render must survive browsing
+    token++
+    setDiskLoop(session.dir, session.pos)
+    navClip = { token, url: toUrl(clip) } // a lost response can still replay this step's clip via resync
+    return { clipUrl: toUrl(clip), ...positionState(session), token }
+  })
+}
+
+// delete every turn after the given one, making it the live tip with its original choices
+export function truncateStory(turnNo, clientToken) {
+  return exclusive(async () => {
+    if (!session) throw new Error('no active game')
+    if (clientToken !== token) throw new Error('stale turn, the game has already advanced')
+    if (!Number.isInteger(turnNo) || turnNo < 0 || turnNo > session.turn) throw new Error('invalid turn')
+    if (renders.has(path.basename(session.dir))) throw new Error('story is being rendered, wait for it to finish')
+    if (turnNo === session.turn) { // nothing after the tip, just land there
+      session.pos = turnNo
+      retagPending(token + 1) // nothing was deleted, the tip's pending render stays valid
+      token++
+      setDiskLoop(session.dir, turnNo)
+      return { ...positionState(session), token }
+    }
+    const raw = session.messages[2 + 2 * turnNo]?.content // assistant response that offered this turn's choices
+    const parsed = typeof raw === 'string' ? parseChoices(raw) : null
+    if (!parsed) throw new Error('cannot restore the choices at that turn')
+    const frame = findFrame(session.dir, turnNo)
+    if (!frame) throw new Error('frame missing on disk for that turn')
+    // stage on a copy and persist before publishing, so a failed save leaves history untouched
     const committed = { ...session }
-    applyTurn(committed, next, frame, session.turn + 1)
-    committed.loaded = false // this clip is newly committed, resync may replay it
-    committed.clip = clip
-    committed.clipPrompt = choice.prompt
-    committed.clipDuration = choice.duration
+    committed.messages = session.messages.slice(0, 3 + 2 * turnNo) // keep through this turn's assistant response
+    committed.choices = parsed.choices
+    committed.loopPrompt = parsed.loopPrompt
+    committed.turn = turnNo
+    committed.pos = turnNo
+    committed.frame = frame
+    committed.loaded = true // the clip into this turn is historical, resync must not replay it
+    const clip = turnNo > 0 ? path.join(session.dir, `clip-${turnNo - 1}.mp4`) : null
+    committed.clip = clip && fs.existsSync(clip) ? clip : null
+    committed.clipPrompt = null // the prompt behind a historical clip isn't recoverable, dev panel goes without
+    committed.clipDuration = null
     saveSession(committed)
     session = committed
-    token++
-    // hold the turn until the new frame's idle loop is also rendered, so the loop is
-    // guaranteed ready the moment the clip ends and the handoff stays seamless,
-    // waiting in short slices so a queued reset isn't stuck behind a cosmetic render
-    const loopReady = startIdleLoopRender(session, token).then(() => true)
-    while (!(await Promise.race([loopReady, new Promise(r => setTimeout(r, 500))])) && !resetInFlight) {}
+    // any cached render belongs to the deleted future, cancel a still-running job
+    if (pendingRender?.token === token && pendingRender.job && !pendingRender.done) cancelJob(pendingRender.job)
     pendingRender = null
-    return { clipUrl: toUrl(clip), frameUrl: toUrl(frame), choices: next.choices.map(c => c.label), token }
+    token++
+    // remove the now-orphaned files of the deleted turns; clip-k leads out of turn k so >= goes
+    for (const name of fs.readdirSync(session.dir)) {
+      const m = name.match(/^(frame|clip|loop)-(\d+)\.\w+$/)
+      const cut = m && (m[1] === 'clip' ? parseInt(m[2]) >= turnNo : parseInt(m[2]) > turnNo)
+      if (cut || name === 'story.mp4') fs.rmSync(path.join(session.dir, name), { force: true }) // stitched render is stale too
+    }
+    setDiskLoop(session.dir, turnNo)
+    return { ...positionState(session), token }
   })
 }
 
@@ -346,6 +534,7 @@ export function loadStory(id) {
     const s = {
       dir,
       turn: d.turn,
+      pos: d.turn, // a resumed story always opens at the tip
       frame: path.join(dir, d.frame),
       context: d.context,
       player: d.player,
@@ -367,10 +556,7 @@ export function loadStory(id) {
     pendingStart = null
     pendingRender = null
     token++
-    dropIdleLoop()
-    // reuse the idle loop already rendered for this frame instead of paying again
-    const loopFile = path.join(dir, `loop-${s.turn}.mp4`)
-    if (fs.existsSync(loopFile)) idleLoop = { token, url: toUrl(loopFile) }
+    setDiskLoop(dir, s.turn) // reuse the idle loop already rendered for this frame instead of paying again
     return { frameUrl: toUrl(s.frame), choices: s.choices.map(c => c.label), token }
   })
 }
@@ -413,7 +599,7 @@ export function renderStory(id) {
       await concatClips(clips, out)
       fs.utimesSync(out, new Date(started), new Date(started)) // a clip landing mid-render still reads as newer
     }
-    return { url: `${toUrl(out)}?v=${fs.statSync(out).mtimeMs}` } // versioned, the browser must not serve a stale cached render
+    return { url: toUrl(out) } // toUrl versions by mtime, the browser must not serve a stale cached render
   }).finally(() => { if (renders.get(id) === p) renders.delete(id) })
   renders.set(id, p)
   return p

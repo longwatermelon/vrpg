@@ -72,7 +72,8 @@ function parseJson(raw) {
 }
 
 // parse and validate the choices json plus idle loop prompt from raw llm output, null if invalid
-function parseChoices(raw) {
+// exported so a saved assistant message can be re-parsed when the timeline is truncated
+export function parseChoices(raw) {
   const obj = parseJson(raw)
   const choices = obj?.choices
   if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
@@ -105,6 +106,49 @@ async function completeJson(messages, format, parse, what) {
 export async function chatChoices(messages) {
   const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, parseChoices, 'choices')
   return { raw, choices: out.choices, loopPrompt: out.loopPrompt }
+}
+
+// strict schema for a single choice written from the player's own idea
+const CUSTOM_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'choice',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string' },
+        prompt: { type: 'string' },
+        duration: { type: 'integer', minimum: 5, maximum: 15 },
+      },
+      required: ['label', 'prompt', 'duration'],
+      additionalProperties: false,
+    },
+  },
+}
+
+// parse and validate a single choice object, null if invalid
+function parseCustom(raw) {
+  const c = parseJson(raw)
+  if (c && typeof c.label === 'string' && c.label.trim() &&
+      typeof c.prompt === 'string' && c.prompt.trim() &&
+      Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15) {
+    return { label: c.label.trim(), prompt: c.prompt, duration: c.duration }
+  }
+  return null
+}
+
+// turn the player's own idea into one concrete choice, taking inspiration rather than quoting it
+export async function customChoice(messages, idea, frameUri) {
+  const ask = {
+    role: 'user',
+    content: [
+      { type: 'text', text: `The player typed their own idea for what to do next: "${idea}"\n\nTake inspiration from that idea and turn it into one concrete choice: a short label plus a video clip prompt and duration following the same rules as your "choices" entries. Stay grounded in the current scene; if the idea doesn't quite fit, adapt its spirit into something that does. Do not offer regular choices for this message. Respond with ONLY a JSON object: {"label": "...", "prompt": "...", "duration": 8}\nAttached image is the current frame the clip will start from.` },
+      { type: 'image_url', image_url: { url: frameUri } },
+    ],
+  }
+  const { out } = await completeJson([...messages, ask], CUSTOM_FORMAT, parseCustom, 'custom choice')
+  return out
 }
 
 // strict schema for the game setup call: fleshed-out character plus opening frame prompt
