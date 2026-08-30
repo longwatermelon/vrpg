@@ -77,3 +77,12 @@ button:disabled { opacity: 0.5; cursor: default; }
   flex-direction: column;
   gap: 8px;
 }
+
+#restart {
+  align-self: center;
+  padding: 6px 12px;
+  font-size: 0.9em;
+  color: #9a9aad;
+  background: none;
+  border-color: #333;
+}

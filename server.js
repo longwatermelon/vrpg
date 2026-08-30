@@ -16,7 +16,7 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, getState } = await import('./game.js') // import after env is loaded
+const { startGame, chooseOption, getState, resetGame } = await import('./game.js') // import after env is loaded
 
 const MIME = {
   '.html': 'text/html',
@@ -116,6 +116,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/choose') {
       const { index, token } = await readJson(req)
       return sendJson(res, 200, await chooseOption(index, token))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/reset') {
+      await readJson(req) // drain the body
+      await resetGame()
+      return sendJson(res, 200, { ok: true })
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(res, 200, getState())

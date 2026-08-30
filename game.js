@@ -32,9 +32,15 @@ let busy = false
 let pendingRender = null // finished render awaiting a successful llm turn, avoids re-billing on retry
 let pendingStart = null // finished opening frame awaiting a successful llm turn, avoids regenerating on retry
 
-// run fn while holding the busy flag, rejects overlapping requests
-async function exclusive(fn) {
-  if (busy) throw new Error('another request is already in progress')
+let resetInFlight = null // dedupes overlapping resets and blocks new game ops from overtaking one
+
+// run fn while holding the busy flag, rejects overlapping requests unless wait is set
+async function exclusive(fn, wait = false) {
+  if (!wait && resetInFlight) throw new Error('a reset is in progress')
+  while (busy) {
+    if (!wait) throw new Error('another request is already in progress')
+    await new Promise(r => setTimeout(r, 500)) // recheck-then-set below is race-free, js is single-threaded
+  }
   busy = true
   try {
     return await fn()
@@ -85,10 +91,11 @@ function commitTurn(s, { msgs, choices }, frame, turn) {
 
 // snapshot of the current session so the client can resync after a lost response
 export function getState() {
-  if (!session) return { active: false, busy }
+  const settling = busy || resetInFlight !== null // a queued reset counts as busy
+  if (!session) return { active: false, busy: settling }
   return {
     active: true,
-    busy,
+    busy: settling,
     token,
     frameUrl: toUrl(session.frame),
     clipUrl: session.clip ? toUrl(session.clip) : null,
@@ -116,6 +123,16 @@ export function startGame(context) {
     pendingStart = null
     return { frameUrl: toUrl(frame), choices: turn.choices.map(c => c.label), token }
   })
+}
+
+// end the current game so a fresh one can be started, waits out any in-flight turn
+export function resetGame() {
+  resetInFlight ??= exclusive(async () => {
+    session = null
+    pendingStart = null
+    pendingRender = null
+  }, true).finally(() => { resetInFlight = null })
+  return resetInFlight
 }
 
 // advance the game with the chosen option, returns the rendered clip and next choices

@@ -7,6 +7,9 @@ const $ = id => document.getElementById(id)
 let currentToken = 0
 try { currentToken = parseInt(sessionStorage.getItem('vrpg-token')) || 0 } catch {}
 
+let playGen = 0 // bumped to invalidate stale playback callbacks
+let uiGen = 0 // bumped on return to the start screen to cancel stale async flows
+
 // update the acknowledged token
 function setToken(t) {
   currentToken = t
@@ -59,6 +62,7 @@ function setChoicesDisabled(disabled) {
 
 // play a clip and show the given choices when it ends
 async function playClip(clipUrl, frameUrl, choices) {
+  const gen = ++playGen
   $('choices').innerHTML = ''
   const video = $('player')
   video.src = clipUrl
@@ -66,15 +70,17 @@ async function playClip(clipUrl, frameUrl, choices) {
   $('frame').hidden = true
   // clip won't play, fall back to its last frame so the player still sees the outcome
   const fallback = () => {
+    if (gen !== playGen) return // superseded, don't touch the ui
     setStatus('Clip playback failed, showing its final frame', true)
     showFrame(frameUrl)
     renderChoices(choices)
   }
-  video.onended = () => renderChoices(choices) // video pauses on its last frame
+  video.onended = () => { if (gen === playGen) renderChoices(choices) } // video pauses on its last frame
   video.onerror = fallback
   try {
     await video.play()
   } catch (err) {
+    if (gen !== playGen) return
     if (err.name !== 'NotAllowedError') return fallback()
     // autoplay blocked, ask for a click
     setStatus('Click the video to play')
@@ -86,15 +92,41 @@ async function playClip(clipUrl, frameUrl, choices) {
   }
 }
 
+// stop playback and drop media handlers so nothing fires afterward
+function stopMedia() {
+  playGen++ // cancel any pending playback callbacks
+  const video = $('player')
+  video.onended = video.onerror = video.onclick = null
+  video.pause()
+  video.removeAttribute('src')
+  video.hidden = true
+  $('frame').removeAttribute('src')
+  $('frame').hidden = true
+}
+
+// clear all game ui and show the start screen, cancels stale async flows
+function toStartScreen() {
+  uiGen++
+  stopMedia()
+  $('choices').innerHTML = ''
+  $('begin').disabled = false
+  $('game-screen').hidden = true
+  $('start-screen').hidden = false
+  setStatus('')
+}
+
 // resync the ui with the server's current session state after an ambiguous failure
 // with mustAdvancePast set, only counts as success if the server moved beyond that token
 async function resync(mustAdvancePast = null) {
+  const gen = uiGen
   let state = await (await fetch('/api/state')).json()
   while (state.busy) { // a turn is still running server-side, wait for it to settle first
+    if (gen !== uiGen) return false
     setStatus('A turn is still in progress...')
     await new Promise(r => setTimeout(r, 3000))
     state = await (await fetch('/api/state')).json()
   }
+  if (gen !== uiGen) return false // restarted meanwhile, drop this stale flow
   if (!state.active) return false
   if (mustAdvancePast !== null && state.token === mustAdvancePast) return false
   const advanced = state.token !== currentToken
@@ -115,6 +147,7 @@ async function resync(mustAdvancePast = null) {
 async function begin() {
   const context = $('context').value.trim()
   if (!context) return
+  const gen = uiGen
   $('begin').disabled = true
   $('start-screen').hidden = true
   $('game-screen').hidden = false
@@ -125,23 +158,23 @@ async function begin() {
     const state = await (await fetch('/api/state')).json()
     if (state.active) baseline = state.token
   } catch {}
+  if (gen !== uiGen) return // restarted meanwhile, don't start a game the ui already left
   let data
   try {
     data = await api('/api/start', { context })
   } catch (err) {
+    if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
     // the game may have started server-side with only the response lost,
     // recover only if the server moved beyond the pre-start baseline
     try {
       if (await resync(baseline)) return
     } catch {}
     // bring the start form back so the player can retry
-    $('start-screen').hidden = false
-    $('game-screen').hidden = true
-    $('begin').disabled = false
-    setStatus('')
+    toStartScreen()
     alert(err.message)
     return
   }
+  if (gen !== uiGen) return resync().catch(() => {}) // a game got created anyway, surface it instead of hiding it
   setToken(data.token)
   showFrame(data.frameUrl)
   setStatus('')
@@ -150,37 +183,74 @@ async function begin() {
 
 // pick a choice, render the clip, play it, then show the next choices
 async function choose(index, labels) {
+  const gen = uiGen
   setChoicesDisabled(true)
   setStatus('Rendering clip... (about a minute)')
   let data
   try {
     data = await api('/api/choose', { index, token: currentToken })
   } catch (err) {
+    if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
     // the failure may be ambiguous, recover only if the server actually advanced
     setStatus(err.message, true)
     try {
       if (await resync(currentToken)) return
+      if (gen !== uiGen) return
+      // the game may have been reset from another tab, return to the start screen
+      const state = await (await fetch('/api/state')).json()
+      if (!state.active) return toStartScreen()
     } catch {}
+    if (gen !== uiGen) return
     renderChoices(labels) // server did not advance, the old choices and error stand
     return
   }
+  if (gen !== uiGen) return
   // the server has advanced, from here on only the new choices may be shown
   setToken(data.token)
   setStatus('')
   await playClip(data.clipUrl, data.frameUrl, data.choices)
 }
 
+// end the current game server-side and return to the start screen
+async function restart() {
+  if (!confirm('Restart and abandon the current game?')) return
+  $('restart').disabled = true
+  setChoicesDisabled(true)
+  setStatus('Restarting... (waits for any turn in progress to finish)')
+  try {
+    await api('/api/reset', {})
+  } catch (err) {
+    // the reset may have succeeded or still be queued server-side, wait for the server to settle
+    let failed
+    try {
+      let state = await (await fetch('/api/state')).json()
+      while (state.busy) {
+        await new Promise(r => setTimeout(r, 3000))
+        state = await (await fetch('/api/state')).json()
+      }
+      failed = state.active // still active once settled means the reset really failed
+    } catch {
+      failed = true
+    }
+    if (failed) {
+      setChoicesDisabled(false)
+      $('restart').disabled = false
+      return setStatus(err.message, true)
+    }
+  }
+  toStartScreen()
+  $('restart').disabled = false
+  $('context').value = ''
+}
+
 $('begin').onclick = begin
+$('restart').onclick = restart
 
 // rejoin an active game after a page refresh
 async function init() {
   try {
-    if (!(await resync())) {
-      // no active game, make sure the start screen is showing
-      $('start-screen').hidden = false
-      $('game-screen').hidden = true
-      setStatus('')
-    }
+    // no active game: normalize to the start screen, unless a begin already took over the ui
+    if (!(await resync()) && !$('start-screen').hidden) toStartScreen()
   } catch {}
 }
 init()
