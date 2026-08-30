@@ -145,7 +145,7 @@ export function getState() {
     frameUrl: toUrl(session.frame),
     clipUrl: session.clip ? toUrl(session.clip) : null,
     loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
-    loopFailed: idleLoop?.token === token ? !!idleLoop.failed : false, // tells the client to stop waiting for one
+    loopFailed: idleLoop?.token === token ? !!idleLoop.failed : true, // no loop entry means none is coming, stop waiting
     choices: session.choices.map(c => c.label),
     cost: getCost(),
   }
@@ -190,7 +190,9 @@ export function startGame(context, player) {
     const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
     commitTurn(candidate, turn, frame, 0)
     session = candidate // replace any previous game only once the opening turn succeeded
-    startIdleLoopRender(session, token) // opening frame's idle loop, renders while the player reads
+    dropIdleLoop() // a replaced game's loop may still be rendering, stop paying for it
+    // no idle loop for the opening turn: the client auto-picks the first choice
+    // immediately, so this frame's choices are normally never shown
     pendingStart = null
     return { frameUrl: toUrl(frame), choices: turn.choices.map(c => c.label), token }
   })

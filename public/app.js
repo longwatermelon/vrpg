@@ -184,13 +184,16 @@ async function playClip(clipUrl, frameUrl, choices) {
   } catch (err) {
     if (gen !== playGen) return
     if (err.name !== 'NotAllowedError') return fallback()
-    // autoplay blocked, ask for a click
-    setStatus('Click the video to play')
+    // audible autoplay blocked (no recent gesture, e.g. the auto-picked opening
+    // clip), play muted so the action still shows; a click restores sound
+    v.muted = true
+    setStatus('Click the video for sound')
     v.onclick = () => {
       v.onclick = null
-      setStatus('')
-      v.play().catch(fallback)
+      v.muted = false
+      if ($('status').textContent === 'Click the video for sound') setStatus('')
     }
+    v.play().catch(fallback)
   }
 }
 
@@ -320,6 +323,8 @@ async function resync(mustAdvancePast = null) {
   setStatus('Recovered current game state') // replace any stale progress or error text
   if (advanced && state.clipUrl) {
     await playClip(state.clipUrl, state.frameUrl, state.choices) // the missed clip
+  } else if (!state.clipUrl) {
+    await choose(0, state.choices, state.frameUrl) // recovered opening turn, keep the auto-pick invariant
   } else {
     showFrame(state.frameUrl)
     renderChoices(state.choices)
@@ -332,11 +337,12 @@ async function begin() {
   const context = $('context').value.trim()
   const character = $('character').value.trim()
   if (!context || !character) return
+  toStartScreen() // cancel any in-flight init resync and clear anything it staged
   const gen = uiGen
   $('begin').disabled = true
   $('start-screen').hidden = true
   $('game-screen').hidden = false
-  const done = startTimer('Generating opening scene...')
+  startTimer('Generating opening scene...')
   // capture the server's token first so a failed start can't recover an unrelated old game
   let baseline = currentToken
   try {
@@ -361,13 +367,14 @@ async function begin() {
   }
   if (gen !== uiGen) return resync().catch(() => {}) // a game got created anyway, surface it instead of hiding it
   setToken(data.token)
-  showFrame(data.frameUrl)
-  done() // hold the final generation time
-  renderChoices(data.choices)
+  // auto-pick the first option instead of showing the opening frame: the screen
+  // stays empty until the opening clip can play, so the first thing seen is action
+  await choose(0, data.choices, data.frameUrl)
 }
 
 // pick a choice, render the clip, play it, then show the next choices
-async function choose(index, labels) {
+// fallbackFrame: frame to put on stage if the choice fails while the screen is still empty
+async function choose(index, labels, fallbackFrame = null) {
   const gen = uiGen
   setChoicesDisabled(true)
   const done = startTimer('Rendering clip...')
@@ -376,16 +383,25 @@ async function choose(index, labels) {
     data = await api('/api/choose', { index, token: currentToken }) // the idle loop keeps playing meanwhile
   } catch (err) {
     if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
-    // the failure may be ambiguous, recover only if the server actually advanced
+    // the failure may be ambiguous, recover only if the server actually advanced;
+    // keep probing until the server gives a conclusive answer
     setStatus(err.message, true)
-    try {
-      if (await resync(currentToken)) return
-      if (gen !== uiGen) return
-      // the game may have been reset from another tab, return to the start screen
-      const state = await (await fetch('/api/state')).json()
-      if (!state.active) return toStartScreen()
-    } catch {}
+    for (;;) {
+      try {
+        if (await resync(currentToken)) return
+        if (gen !== uiGen) return
+        // the game may have been reset from another tab, return to the start screen
+        const state = await (await fetch('/api/state')).json()
+        if (!state.active) return toStartScreen()
+        break // settled without advancing, the choice really failed
+      } catch {
+        if (gen !== uiGen) return
+        await new Promise(r => setTimeout(r, 3000)) // server unreachable, try again
+      }
+    }
     if (gen !== uiGen) return
+    setStatus(err.message, true) // resync's progress text may have replaced the error
+    if (fallbackFrame) showFrame(fallbackFrame) // nothing was on stage yet, put the frame up
     renderChoices(labels) // server did not advance, the old choices and error stand
     return
   }
