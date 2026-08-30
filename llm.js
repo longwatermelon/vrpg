@@ -1,4 +1,4 @@
-const MODEL = 'anthropic/claude-sonnet-4.5'
+const MODEL = 'anthropic/claude-opus-4.6'
 const API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
 // strict schema for the choices contract, enforced server-side by openrouter
@@ -95,7 +95,7 @@ export async function chatChoices(messages) {
   return { raw, choices }
 }
 
-const SCENE_SYSTEM = `You rewrite a player's narrative scene description into a prompt for an image generation model. The image must be a strict first-person POV shot seen through the narrator's eyes. Image models cannot do perspective-taking, so never refer to the narrator with pronouns: no "I", "me", "my", "you", or "we". Describe only what the camera sees: open with "First-person POV shot", have people who are looking at the narrator look into the camera (everyone else keeps their described gaze and pose), put nearby objects in the foreground, and mention the viewer's hands or body at the frame edge only when the scene implies them. Keep every concrete detail from the player's description and invent nothing important. Respond with only the rewritten prompt.`
+const SCENE_SYSTEM = `You rewrite a player's narrative scene description into a prompt for an image generation model. The image MUST be a first-person POV shot seen through the narrator's eyes. Image models cannot do perspective-taking, so don't say something like "I do x" - the image model will not render that in first-person. Describe what the narrator sees: open with "First-person POV shot; camera from the perspective of a man in the scene.", rewrite all first-person references as what the camera sees, and have people who are looking at the narrator look into the camera (everyone else keeps their described gaze and pose). All other details remain the same. Respond with only the rewritten prompt.`
 
 // rewrite the player's context into a first-person pov camera prompt for the image model, retrying once on a bad rewrite
 export async function rewriteScenePrompt(context) {
