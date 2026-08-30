@@ -132,7 +132,7 @@ export function chooseOption(index, clientToken) {
       throw new Error(`a render for "${session.choices[pendingRender.index].label}" is already pending, retry that choice`)
     }
     if (pendingRender?.token !== token) {
-      pendingRender = { token, index, job: await submitJob(`First-person POV. ${choice.prompt}`, toDataUri(session.frame)), done: false }
+      pendingRender = { token, index, job: await submitJob(`First-person POV; you are the camera. ${choice.prompt}`, toDataUri(session.frame)), done: false }
     }
     if (!pendingRender.done) {
       try {
