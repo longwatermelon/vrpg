@@ -34,7 +34,7 @@ So the user message is structured as `Choose option: <option label>\nAttached im
 }
 ```
 
-Use start keyframe = current frozen frame, send prompt "First-person POV. `(prompt field)`" to video model along with start keyframe. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
+Use start keyframe = current frozen frame, send prompt "First-person POV; you are the camera. `(prompt field)`" to video model along with start keyframe. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
 
 ## Models
 
