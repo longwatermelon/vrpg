@@ -108,10 +108,12 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (req.method === 'POST' && url.pathname === '/api/start') {
-      const { context } = await readJson(req)
+      const { context, character } = await readJson(req)
       if (typeof context !== 'string' || !context.trim()) return sendJson(res, 400, { error: 'context is required' })
+      if (typeof character !== 'string' || !character.trim()) return sendJson(res, 400, { error: 'character is required' })
       if (context.length > 2000) return sendJson(res, 400, { error: 'context too long, keep it under 2000 characters' })
-      return sendJson(res, 200, await startGame(context.trim()))
+      if (character.length > 500) return sendJson(res, 400, { error: 'character too long, keep it under 500 characters' })
+      return sendJson(res, 200, await startGame(context.trim(), character.trim()))
     }
     if (req.method === 'POST' && url.pathname === '/api/choose') {
       const { index, token } = await readJson(req)

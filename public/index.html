@@ -7,11 +7,13 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <!-- start screen: player describes the story context -->
+  <!-- start screen: player describes their character and the story context -->
   <div id="start-screen">
     <h1>vrpg</h1>
+    <p>Describe the character you'll play.</p>
+    <textarea id="character" rows="2" maxlength="500" placeholder="e.g. a wiry young woman with a scar over one eye, worn leather armor, red cloak"></textarea>
     <p>Describe the starting point of your story.</p>
-    <textarea id="context" rows="4" maxlength="2000" placeholder="e.g. I wake up in a medieval tavern with no memory, a hooded figure sits across from me..."></textarea>
+    <textarea id="context" rows="4" maxlength="2000" placeholder="e.g. waking up in a medieval tavern with no memory, a hooded figure sitting across the table..."></textarea>
     <button id="begin">Begin</button>
   </div>
 

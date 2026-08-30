@@ -1,28 +1,31 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chatChoices } from './llm.js'
+import { chatChoices, startScene } from './llm.js'
 import { submitJob, awaitJob, submitImageJob, awaitImageJob } from './fal.js'
 import { extractLastFrame } from './media.js'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(ROOT, 'data')
 
-const SYSTEM_PROMPT = `You are the game master of a video-rendered first-person RPG. The player never reads your text; they only watch generated video clips. Your responses are consumed by a program that feeds them to a video generation model.
+// build the game master system prompt around the fleshed-out player character description
+function systemPrompt(character) {
+  return `You are the game master of a video-rendered RPG. The player never reads your text; they only watch generated video clips. Your responses are consumed by a program that feeds them to a video generation model.
 
-Each turn you receive the player's chosen action plus an image of the frame where the story currently stands. You respond with ONLY a JSON object (no markdown fences, no commentary) in exactly this format:
+The player controls one character in the story. Their appearance: ${character}
+
+Each turn you receive the player's chosen action plus an image of the frame where the story currently stands. Respond with ONLY a JSON object (no markdown fences, no commentary) offering 2-3 choices:
 {"choices": [{"label": "...", "prompt": "..."}]}
 
-Offer 2-3 choices per turn.
-  * "label" is a short action the player can pick, e.g. "Eat the sandwich" or "Say: \\"What are you doing here?\\"".
-  * "prompt" describes a 5-second first-person POV video clip that starts from the current frame.
-    - The video model starts from scratch on every clip: it sees only the start keyframe and your prompt, nothing else. Each prompt must be stateless and fully self-contained, leaning only on context that is visible in the current frozen frame; any information about setting or characters or objects outside of the current frozen frame must be fully re-described.
-    - So: that means, don't refer to characters by name or story role (the video model doesn't know what those are). You can refererence characters by where they are in the start keyframe (if they're in frame). If they're not in-frame, you must re-describe them fully and note that the character is currently off-screen and provide an on-ramp in the prompt which describes how they enter the scene.
+"label" is a short action the player's character can take, e.g. "Eat the sandwich" or "Say: \\"What are you doing here?\\"".
+
+"prompt" describes a 5-second video clip starting from the current frame. The video model sees only the start keyframe and your prompt, nothing else, so each prompt must be self-contained: re-describe anything not visible in the frame, and refer to characters by appearance, never by name or story role (for the player's character, reuse the appearance above). If a character is off-screen, re-describe them and describe how they enter the scene.
 
 Make the story interesting and fun; be creative.
 
-Example response assuming the image attached is of your girlfriend sitting across from you at dinner with a sandwich on her plate (label may use story knowledge, prompt may not):
-{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "Start context: You are seated at a wooden table in a cozy diner with red booth seats and warm lighting, a young woman with short black hair in a yellow hoodie seated across the table. Action: You pick up the half-eaten sandwich from the plate of the woman seated across the table and eat it. A crunch sound plays as the sandwich is consumed. She looks at you, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she is looking annoyed at the camera, the diner unchanged around you."}, {"label": "Call the waiter over", "prompt": "Start context: You are seated at a wooden table in a cozy diner with red booth seats and warm lighting, a young woman with short black hair in a yellow hoodie seated across the table. Action: You raise your hand, and a middle-aged man in a white apron (currently off-screen) walks into view from the right and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman across the table watching him."}]}`
+Example response (player character: a tall young man with short brown hair in a gray hoodie; frame: him at dinner with his girlfriend, a sandwich on her plate - labels may use story knowledge, prompts may not):
+{"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie."}, {"label": "Call the waiter over", "prompt": "The man in the gray hoodie sitting at the table raises his hand, and a middle-aged man in a white apron (currently off-screen) walks into view and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman watching him."}]}`
+}
 
 let session = null // single in-memory session
 let token = 0 // monotonically increasing turn token, never reused across sessions
@@ -101,16 +104,30 @@ export function getState() {
   }
 }
 
-// start a new game from the player's context, returns the opening frame and choices
-export function startGame(context) {
+// prompts behind the current turn for the dev panel
+export function getDebug() {
+  if (!session) return { active: false }
+  return {
+    active: true,
+    token,
+    scenePrompt: session.scenePrompt,
+    clipPrompt: session.clipPrompt || null,
+    choices: session.choices,
+  }
+}
+
+// start a new game from the player's context and character, returns the opening frame and choices
+export function startGame(context, player) {
   return exclusive(async () => {
     // reuse the submitted job or finished opening frame if this is a retry of the same start
-    if (pendingStart?.context !== context) {
+    if (pendingStart?.context !== context || pendingStart?.player !== player) {
       const dir = path.join(DATA_DIR, String(Date.now()))
       fs.mkdirSync(dir, { recursive: true })
-      pendingStart = { context, dir, job: await submitImageJob(`First-person POV from the perspective of what a person who is describing the following scene is seeing: ${context}. REMEMBER: EXTREMELY IMPORTANT, GENERATE THE FIRST-PERSON POV FROM THE PERSPECTIVE OF THE NARRATOR DESCRIBING THIS SCENE. IT STRICTLY **MUST** BE FIRST-PERSON.`) }
+      // flesh out the character and write the opening frame prompt before paying for the image
+      const { character, scene } = await startScene(context, player)
+      pendingStart = { context, player, character, scene, dir, job: await submitImageJob(scene) }
     }
-    const { dir } = pendingStart
+    const { dir, character, scene } = pendingStart
     if (!pendingStart.frame) {
       try {
         pendingStart.frame = await awaitImageJob(pendingStart.job, path.join(dir, 'frame-0'))
@@ -120,7 +137,7 @@ export function startGame(context) {
       }
     }
     const frame = pendingStart.frame
-    const candidate = { dir, turn: 0, frame, messages: [{ role: 'system', content: SYSTEM_PROMPT }], choices: [] }
+    const candidate = { dir, turn: 0, frame, scenePrompt: scene, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
     const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
     commitTurn(candidate, turn, frame, 0)
     session = candidate // replace any previous game only once the opening turn succeeded
@@ -153,7 +170,7 @@ export function chooseOption(index, clientToken) {
       throw new Error(`a render for "${session.choices[pendingRender.index].label}" is already pending, retry that choice`)
     }
     if (pendingRender?.token !== token) {
-      pendingRender = { token, index, job: await submitJob(`First-person POV; you are the camera. ${choice.prompt}`, toDataUri(session.frame)), done: false }
+      pendingRender = { token, index, job: await submitJob(choice.prompt, toDataUri(session.frame)), done: false }
     }
     if (!pendingRender.done) {
       try {
@@ -168,6 +185,7 @@ export function chooseOption(index, clientToken) {
     const next = await nextTurn(session, `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`, frame)
     commitTurn(session, next, frame, session.turn + 1)
     session.clip = clip
+    session.clipPrompt = choice.prompt
     pendingRender = null
     return { clipUrl: toUrl(clip), frameUrl: toUrl(frame), choices: next.choices.map(c => c.label), token }
   })

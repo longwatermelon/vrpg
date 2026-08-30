@@ -53,64 +53,80 @@ async function complete(messages, format) {
   return text
 }
 
-const POV_RE = /^first-person pov shot\b/i // every prompt sent to the video/image models must open with this
-
-// true if text reads as camera language: right opener, no narrator pronouns outside <d> dialogue
-// or quoted diegetic text (signs, notes)
-// "mine" is deliberately not checked (doubles as a noun), "us" only lowercase so "the US" passes
-function isPov(text) {
-  const t = text.replace(/<d>.*?<\/d>/gs, '').replace(/"[^"]*"/g, '')
-  return POV_RE.test(text) &&
-    !/\b(i|me|my|myself|we|our|ours|ourselves|you|your|yours|yourself|yourselves)\b/i.test(t) &&
-    !/\bus\b/.test(t)
+// strip markdown fences and parse json from raw llm output, null on failure
+function parseJson(raw) {
+  const text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+  try { return JSON.parse(text) } catch { return null }
 }
 
 // parse and validate the choices json from raw llm output, null if invalid
 function parseChoices(raw) {
-  const text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
-  try {
-    const choices = JSON.parse(text).choices
-    if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
-        choices.every(c => typeof c.label === 'string' && c.label.trim() &&
-                           typeof c.prompt === 'string' && isPov(c.prompt.trim()))) {
-      return choices
-    }
-  } catch {}
+  const choices = parseJson(raw)?.choices
+  if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
+      choices.every(c => typeof c.label === 'string' && c.label.trim() &&
+                         typeof c.prompt === 'string' && c.prompt.trim())) {
+    return choices
+  }
   return null
+}
+
+// call the llm expecting json, retrying once on invalid output, parse returns null when invalid
+async function completeJson(messages, format, parse, what) {
+  let raw = await complete(messages, format)
+  let out = parse(raw)
+  if (!out) { // one retry asking the llm to fix its format
+    raw = await complete([
+      ...messages,
+      { role: 'assistant', content: raw },
+      { role: 'user', content: 'That response was not valid. Respond with only the JSON object in the required format.' },
+    ], format)
+    out = parse(raw)
+    if (!out) throw new Error(`llm returned invalid ${what} json`)
+  }
+  return { raw, out }
 }
 
 // get the next set of choices from the llm, retrying once on bad json
 export async function chatChoices(messages) {
-  let raw = await complete(messages, RESPONSE_FORMAT)
-  let choices = parseChoices(raw)
-  if (!choices) { // one retry asking the llm to fix its format
-    raw = await complete([
-      ...messages,
-      { role: 'assistant', content: raw },
-      { role: 'user', content: 'That response was not valid. Respond with only the JSON object in the required format, with every prompt starting with "First-person POV shot" and using no first- or second-person pronouns outside dialogue.' },
-    ], RESPONSE_FORMAT)
-    choices = parseChoices(raw)
-    if (!choices) throw new Error('llm returned invalid choices json')
-  }
-  return { raw, choices }
+  const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, parseChoices, 'choices')
+  return { raw, choices: out }
 }
 
-const SCENE_SYSTEM = `You rewrite a player's narrative scene description into a prompt for an image generation model. The image MUST be a first-person POV shot seen through the narrator's eyes. Image models cannot do perspective-taking, so don't say something like "I do x" - the image model will not render that in first-person. Describe what the narrator sees: open with "First-person POV shot; camera from the perspective of a man in the scene.", rewrite all first-person references as what the camera sees, and have people who are looking at the narrator look into the camera (everyone else keeps their described gaze and pose). All other details remain the same. Respond with only the rewritten prompt.`
+// strict schema for the game setup call: fleshed-out character plus opening frame prompt
+const SCENE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'scene',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: { character: { type: 'string' }, scene: { type: 'string' } },
+      required: ['character', 'scene'],
+      additionalProperties: false,
+    },
+  },
+}
 
-// rewrite the player's context into a first-person pov camera prompt for the image model, retrying once on a bad rewrite
-export async function rewriteScenePrompt(context) {
-  const messages = [
-    { role: 'system', content: SCENE_SYSTEM },
-    { role: 'user', content: context },
-  ]
-  let text = (await complete(messages)).trim()
-  if (!isPov(text)) { // one retry before sending a bad prompt to a paid job
-    text = (await complete([
-      ...messages,
-      { role: 'assistant', content: text },
-      { role: 'user', content: 'That response was not valid. Respond with only the rewritten prompt, starting with "First-person POV shot" and using no first- or second-person pronouns.' },
-    ])).trim()
-    if (!isPov(text)) throw new Error('llm returned a non-pov scene prompt')
+const SCENE_SYSTEM = `You are receiving a perspective written from the perspective of a character in a scene, along with a brief description of what that character looks like. Respond with ONLY a JSON object in exactly this format:
+{"character": "...", "scene": "..."}
+  * "character": a concrete visual description of the player's character in one or two sentences (age, build, hair, clothing, distinguishing features) - only what a camera can see, no name or backstory. It gets pasted into image/video prompts to identify the character.
+  * "scene": a prompt for an image model rendering the scene the character is describing: the character should exist in third-person as just another character in the scene, and the scene around them should match the context the character describes.`
+
+// parse and validate the scene json, null if invalid
+function parseScene(raw) {
+  const out = parseJson(raw)
+  if (out && typeof out.character === 'string' && out.character.trim() &&
+      typeof out.scene === 'string' && out.scene.trim()) {
+    return { character: out.character.trim(), scene: out.scene.trim() }
   }
-  return text
+  return null
+}
+
+// flesh out the player character and write the opening frame prompt, retrying once on bad json
+export async function startScene(context, player) {
+  const { out } = await completeJson([
+    { role: 'system', content: SCENE_SYSTEM },
+    { role: 'user', content: `Starting context: ${context}\nPlayer character: ${player}` },
+  ], SCENE_FORMAT, parseScene, 'scene')
+  return out
 }

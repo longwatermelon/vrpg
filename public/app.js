@@ -172,10 +172,11 @@ async function resync(mustAdvancePast = null) {
   return true
 }
 
-// start a new game from the context textbox
+// start a new game from the character and context textboxes
 async function begin() {
   const context = $('context').value.trim()
-  if (!context) return
+  const character = $('character').value.trim()
+  if (!context || !character) return
   const gen = uiGen
   $('begin').disabled = true
   $('start-screen').hidden = true
@@ -190,7 +191,7 @@ async function begin() {
   if (gen !== uiGen) return // restarted meanwhile, don't start a game the ui already left
   let data
   try {
-    data = await api('/api/start', { context })
+    data = await api('/api/start', { context, character })
   } catch (err) {
     if (gen !== uiGen) return // restarted meanwhile, drop this stale flow
     // the game may have started server-side with only the response lost,
@@ -270,6 +271,7 @@ async function restart() {
   toStartScreen()
   $('restart').disabled = false
   $('context').value = ''
+  $('character').value = ''
 }
 
 $('begin').onclick = begin

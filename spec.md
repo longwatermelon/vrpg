@@ -4,9 +4,11 @@
 
 The story is text-first; it's essentially an LLM chat except the LLM responds with a single json object that describes the branches which can occur next, and the player chooses the branch to go down. The player never reads the LLM chat; the game is purely video from their perspective, so the clips generated must contain all info from the scene the player needs to know.
 
+The player controls one character in the story, described by them at the start. Prompts refer to that character by appearance like any other character in the scene; nothing is privileged about them except that the player picks their actions. (First-person POV prompts were tried and consistently confused the image/video models.)
+
 ## Playthrough structure
 
-First, the player is greeted with a textbox in which they describe the basic context or starting point of the story. That context gets sent as the first user message in the LLM chat. A separate LLM call rewrites the context into first-person POV camera language (image models can't do perspective-taking from narrative "I" statements), and that rewritten prompt is used by an image model to generate the starting frame (Seedream 4.5 via Fal), which will be fed to the LLM as an attachment on the first user message.
+First, the player fills in two textboxes: a description of the character they'll control, and the basic context or starting point of the story. A setup LLM call fleshes the character description into a concrete visual description (what a camera can see, no name or backstory) and writes the opening frame prompt: a third-person shot of the starting scene with the player character in it. That prompt is used by an image model to generate the starting frame (Seedream 4.5 via Fal), which will be fed to the story LLM as an attachment on the first user message. The fleshed-out character description goes into the story LLM's system prompt so every clip prompt can re-describe the character consistently.
 
 At this point, the player enters the main game loop, which consists of the following steps:
   * LLM generates 2-3 options for the player to take in the LLM chat as its response, formatted as json. Options displayed on screen.
@@ -24,17 +26,17 @@ So the user message is structured as `Choose option: <option label>\nAttached im
   "choices": [
     {
       "label": "Eat your girlfriend's sandwich",
-      "prompt": "First-person POV shot seated at the restaurant table. The viewer's hand picks up the sandwich from the girl's plate and eats it. A crunch sound plays as the sandwich is consumed. She looks into the camera, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. In the end, the sandwich is completely gone from the girl's plate and she is looking annoyed into the camera."
+      "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him with a sandwich on her plate. Action: the man in the gray hoodie picks up the sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from the woman's plate and she sits glaring at the man."
     },
     {
       "label": "Get up and leave",
-      "prompt": "First-person POV shot rising from the restaurant table, the camera turning around and walking out of the restaurant. The girl looks confused and says <d>[English] Hey, where are you going!?</d>."
+      "prompt": "Start context: a tall young man with short brown hair in a gray hoodie sits at a restaurant table, a young woman seated across from him. Action: the man in the gray hoodie rises from the table and walks out of the restaurant. The woman looks confused and says <d>[English] Hey, where are you going!?</d>."
     }
   ]
 }
 ```
 
-Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; the LLM is instructed to write every prompt in first-person POV camera language (starting with "First-person POV shot"), so nothing is prepended. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
+Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; nothing is prepended. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
 
 ## Models
 
@@ -44,4 +46,3 @@ Video model: Minimax H3 Max (via Fal AI).
   * 480p with `disabled` prompt expansion mode
 
 Starting frame image model: Bytedance Seedream 4.5 (via Fal AI).
-
