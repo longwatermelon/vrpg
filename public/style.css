@@ -262,6 +262,37 @@ textarea:focus-visible {
 
 #choices:empty { display: none; } /* no scrim between turns */
 
+/* render wait: the picked option centers vertically in the options area over a loading bar */
+#choices.pending {
+  justify-content: center;
+  min-height: 340px; /* roughly the options stack height, so the pick sits where the middle was */
+}
+
+#choices button.picked:disabled {
+  opacity: 1;
+  cursor: default;
+  border-color: rgba(217, 164, 65, 0.55);
+}
+
+#choices button.picked::before { opacity: 1; }
+
+/* thin ember loading bar, width driven from the server's pipeline progress */
+.bar {
+  width: min(640px, 100%);
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(236, 232, 223, 0.15);
+  overflow: hidden;
+}
+
+.bar-fill {
+  width: 2%;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--ember);
+  transition: width 0.25s linear;
+}
+
 /* narrow screens: drop the status below the corner elements so they can't overlap */
 @media (max-width: 600px) {
   #status {

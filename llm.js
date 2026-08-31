@@ -33,13 +33,9 @@ const RESPONSE_FORMAT = {
   },
 }
 
-let cost = 0 // running openrouter spend in usd for this process
-
-// running openrouter spend in usd
-export function getLlmCost() { return cost }
-
 // call openrouter chat completions and return the assistant text, format is an optional response_format
-async function complete(messages, format) {
+// cost is the story's cost tracker, billed usd goes through cost.bill
+async function complete(messages, format, cost) {
   const res = await fetch(API_URL, {
     method: 'POST',
     headers: {
@@ -59,7 +55,7 @@ async function complete(messages, format) {
   })
   if (!res.ok) throw new Error(`openrouter request failed: ${res.status} ${await res.text()}`)
   const data = await res.json()
-  cost += data.usage?.cost || 0 // billed even when the content turns out unusable
+  cost.bill('llm', data.usage?.cost || 0) // billed even when the content turns out unusable
   const text = data.choices?.[0]?.message?.content
   if (!text) throw new Error(`openrouter returned no content: ${JSON.stringify(data).slice(0, 500)}`)
   return text
@@ -87,15 +83,15 @@ export function parseChoices(raw) {
 }
 
 // call the llm expecting json, retrying once on invalid output, parse returns null when invalid
-async function completeJson(messages, format, parse, what) {
-  let raw = await complete(messages, format)
+async function completeJson(messages, format, parse, what, cost) {
+  let raw = await complete(messages, format, cost)
   let out = parse(raw)
   if (!out) { // one retry asking the llm to fix its format
     raw = await complete([
       ...messages,
       { role: 'assistant', content: raw },
       { role: 'user', content: 'That response was not valid. Respond with only the JSON object in the required format.' },
-    ], format)
+    ], format, cost)
     out = parse(raw)
     if (!out) throw new Error(`llm returned invalid ${what} json`)
   }
@@ -103,8 +99,8 @@ async function completeJson(messages, format, parse, what) {
 }
 
 // get the next set of choices plus idle loop prompt from the llm, retrying once on bad json
-export async function chatChoices(messages) {
-  const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, parseChoices, 'choices')
+export async function chatChoices(messages, cost) {
+  const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, parseChoices, 'choices', cost)
   return { raw, choices: out.choices, loopPrompt: out.loopPrompt }
 }
 
@@ -139,7 +135,7 @@ function parseCustom(raw) {
 }
 
 // turn the player's own idea into one concrete choice, taking inspiration rather than quoting it
-export async function customChoice(messages, idea, frameUri) {
+export async function customChoice(messages, idea, frameUri, cost) {
   const ask = {
     role: 'user',
     content: [
@@ -147,7 +143,7 @@ export async function customChoice(messages, idea, frameUri) {
       { type: 'image_url', image_url: { url: frameUri } },
     ],
   }
-  const { out } = await completeJson([...messages, ask], CUSTOM_FORMAT, parseCustom, 'custom choice')
+  const { out } = await completeJson([...messages, ask], CUSTOM_FORMAT, parseCustom, 'custom choice', cost)
   return out
 }
 
@@ -182,10 +178,10 @@ function parseScene(raw) {
 }
 
 // flesh out the player character and write the opening frame prompt, retrying once on bad json
-export async function startScene(context, player) {
+export async function startScene(context, player, cost) {
   const { out } = await completeJson([
     { role: 'system', content: SCENE_SYSTEM },
     { role: 'user', content: `Starting context: ${context}\nPlayer character: ${player}` },
-  ], SCENE_FORMAT, parseScene, 'scene')
+  ], SCENE_FORMAT, parseScene, 'scene', cost)
   return out
 }

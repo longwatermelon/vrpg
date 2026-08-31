@@ -12,16 +12,11 @@ const IMAGE_COST = 0.04 // seedream 4.5 flat rate per image
 // h3 max 480p rate per second, launch promo ends sept 1
 function videoRate() { return Date.now() < Date.parse('2026-09-01') ? 0.025 : 0.05 }
 
-let cost = 0 // running fal spend in usd for this process
-
-// running fal spend in usd
-export function getFalCost() { return cost }
-
-// count a completed job's cost once, a retried await must not charge twice
-function charge(job, amount) {
+// count a completed job's cost once into the story's tracker, a retried await must not charge twice
+function charge(job, amount, cost) {
   if (job.charged) return
   job.charged = true
-  cost += amount
+  cost.bill('fal', amount)
 }
 
 const headers = { Authorization: `Key ${process.env.FAL_API_KEY}`, 'Content-Type': 'application/json' }
@@ -94,10 +89,10 @@ async function pollResult({ status_url, response_url, cancel_url }) {
   return await result.json()
 }
 
-// wait for a submitted image-to-video job and download the clip to outPath
-export async function awaitJob(job, outPath) {
+// wait for a submitted image-to-video job and download the clip to outPath, billing cost.fal
+export async function awaitJob(job, outPath, cost) {
   const { video } = await pollResult(job)
-  charge(job, job.cost) // the render completed, it billed
+  charge(job, job.cost, cost) // the render completed, it billed
   if (!video?.url) {
     const err = new Error('fal returned no video url')
     err.terminal = true
@@ -120,10 +115,10 @@ export async function submitImageJob(prompt) {
   return await submit.json()
 }
 
-// wait for a submitted image job, save it as outBase plus extension, return the path
-export async function awaitImageJob(job, outBase) {
+// wait for a submitted image job, save it as outBase plus extension, return the path, billing cost.fal
+export async function awaitImageJob(job, outBase, cost) {
   const { images } = await pollResult(job)
-  charge(job, IMAGE_COST) // the render completed, it billed
+  charge(job, IMAGE_COST, cost) // the render completed, it billed
   const image = images?.[0]
   if (!image?.url) {
     const err = new Error('fal returned no image url')

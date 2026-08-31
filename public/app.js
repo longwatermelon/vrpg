@@ -92,6 +92,7 @@ function turnUiTail() {
 function renderChoices(labels, idea = '') {
   const box = $('choices')
   box.innerHTML = ''
+  box.classList.remove('pending')
   labels.forEach((label, i) => {
     const btn = document.createElement('button')
     btn.textContent = label
@@ -119,6 +120,7 @@ function renderChoices(labels, idea = '') {
 function renderContinue() {
   const box = $('choices')
   box.innerHTML = ''
+  box.classList.remove('pending')
   const btn = document.createElement('button')
   btn.className = 'continue'
   btn.textContent = 'Continue'
@@ -178,6 +180,53 @@ function setChoicesDisabled(disabled) {
   for (const el of $('choices').querySelectorAll('button, input')) el.disabled = disabled
 }
 
+// drive the loading bar from the server's weighted pipeline progress until it leaves the dom
+function startProgressBar() {
+  const fill = $('choices').querySelector('.bar-fill')
+  if (!fill) return
+  let snap = null // latest server progress plus when it arrived
+  const poll = async () => {
+    try {
+      const p = (await (await fetch('/api/state')).json()).progress
+      if (p) snap = { ...p, at: Date.now() }
+    } catch {} // transient, keep the last snapshot
+  }
+  poll()
+  const pollId = setInterval(poll, 2000)
+  let shown = 2 // the bar only ever grows, a reweighted total or late snapshot must not pull it back
+  const drawId = setInterval(() => {
+    if (!fill.isConnected) { clearInterval(pollId); clearInterval(drawId); return } // bar replaced, done
+    if (!snap) return
+    const total = snap.weights.reduce((a, b) => a + b, 0)
+    // completed steps count in full, the running step by its live elapsed time capped at its weight
+    let done = snap.weights.slice(0, snap.step).reduce((a, b) => a + b, 0)
+    done += Math.min(snap.elapsed + (Date.now() - snap.at) / 1000, snap.weights[snap.step] || 0)
+    shown = Math.max(shown, Math.min(done / total, 0.98) * 100)
+    fill.style.width = `${shown}%`
+  }, 250)
+}
+
+// replace the options with the picked one centered in the area, a loading bar beneath
+function showPending(label) {
+  const box = $('choices')
+  box.innerHTML = ''
+  box.classList.add('pending')
+  if (label) {
+    const btn = document.createElement('button')
+    btn.className = 'picked'
+    btn.textContent = label
+    btn.disabled = true
+    box.appendChild(btn)
+  }
+  const bar = document.createElement('div')
+  bar.className = 'bar'
+  const fill = document.createElement('div')
+  fill.className = 'bar-fill'
+  bar.appendChild(fill)
+  box.appendChild(bar)
+  startProgressBar()
+}
+
 // play a clip and show the given choices (or a continue button) when it ends
 // idea prefills the custom box afterward, a pending custom action must survive playback
 async function playClip(clipUrl, frameUrl, choices, mode = 'choices', idea = '') {
@@ -199,6 +248,7 @@ async function playClip(clipUrl, frameUrl, choices, mode = 'choices', idea = '')
   loop?.stop() // the clip supersedes any idle loop
   const gen = ++playGen
   $('choices').innerHTML = ''
+  $('choices').classList.remove('pending')
   if ($('dev').open) loadDev() // the turn has advanced server-side, refresh an open dev panel now
   $('frame').src = frameUrl // keep the hidden img on the latest frozen frame for fallbacks
   if (!ok) { // preload broke or stalled, degrade to the outcome frame instead of cutting to black
@@ -342,6 +392,7 @@ function toStartScreen() {
   devToken = null
   $('dev-body').textContent = ''
   $('choices').innerHTML = ''
+  $('choices').classList.remove('pending')
   $('sidebar').hidden = true // close the timeline with the game it belongs to
   $('begin').disabled = false
   $('game-screen').hidden = true
@@ -389,6 +440,7 @@ async function loadStories() {
     actions.className = 'story-actions'
     if (s.resumable) actions.appendChild(storyBtn('Resume', () => resumeStory(s.id), true))
     if (s.clips > 0) actions.appendChild(storyBtn('Render', e => renderStory(s.id, e.target)))
+    if (s.clips > 0 && s.resumable) actions.appendChild(storyBtn('Render + Choices', e => renderStory(s.id, e.target, true))) // needs the transcript for the options
     actions.appendChild(storyBtn('Delete', () => deleteStory(s.id)))
     info.append(title, meta, actions)
     card.append(img, info)
@@ -434,15 +486,16 @@ async function resumeStory(id) {
 }
 
 // render the story's main clips into one video server-side, then download it
-async function renderStory(id, btn) {
+// choices overlays each turn's options on its clip, the picked one highlighted
+async function renderStory(id, btn, choices = false) {
   btn.disabled = true
   const old = btn.textContent
   btn.textContent = 'Rendering...'
   try {
-    const { url } = await api('/api/render', { id })
+    const { url } = await api('/api/render', { id, choices })
     const a = document.createElement('a')
     a.href = url
-    a.download = `vrpg-story-${id}.mp4`
+    a.download = `vrpg-story-${id}${choices ? '-choices' : ''}.mp4`
     a.click()
   } catch (err) {
     alert(err.message)
@@ -500,6 +553,7 @@ async function begin() {
   $('begin').disabled = true
   $('start-screen').hidden = true
   $('game-screen').hidden = false
+  showPending(null) // no picked option yet, just the loading bar
   const done = startTimer('Generating opening scene...')
   // capture the server's token first so a failed start can't recover an unrelated old game
   let baseline = currentToken
@@ -536,20 +590,22 @@ let opBusy = false // one turn or timeline request at a time client-side, their 
 
 // run a turn-advancing api call with ambiguous-failure recovery, then play the resulting clip
 // restore re-renders the pre-call ui when the server provably did not advance
-async function advanceTurn(label, request, restore) {
+// picked, when given, is the chosen option's label shown centered with the loading bar
+async function advanceTurn(label, request, restore, picked) {
   if (opBusy) return
   opBusy = true
   try {
-    await advanceTurnInner(label, request, restore)
+    await advanceTurnInner(label, request, restore, picked)
   } finally {
     opBusy = false
   }
 }
 
 // body of advanceTurn, wrapped so the busy flag always releases
-async function advanceTurnInner(label, request, restore) {
+async function advanceTurnInner(label, request, restore, picked) {
   const gen = uiGen
   setChoicesDisabled(true)
+  if (picked !== undefined) showPending(picked)
   const done = label ? startTimer(label) : () => setStatus('') // instant actions get no timer
   let data
   try {
@@ -592,7 +648,8 @@ function choose(index, labels) {
   const idea = $('choices').querySelector('.custom-choice input')?.value || '' // keep a half-typed idea across a failure
   return advanceTurn('Rendering clip...',
     () => api('/api/choose', { index, token: currentToken }),
-    pendingIdea => renderChoices(labels, pendingIdea ?? idea))
+    pendingIdea => renderChoices(labels, pendingIdea ?? idea),
+    labels[index])
 }
 
 // send the player's own idea, the llm writes an action from it, then render and play it
@@ -600,7 +657,8 @@ function chooseCustom(text, labels) {
   return advanceTurn('Writing your action and rendering clip...',
     () => api('/api/choose-custom', { text, token: currentToken }),
     // keep the idea in the box, a retry must resend the same text; a differing server-pending idea wins
-    pendingIdea => renderChoices(labels, pendingIdea ?? text))
+    pendingIdea => renderChoices(labels, pendingIdea ?? text),
+    text)
 }
 
 // replay the next canonical clip while browsing history, already rendered so no timer

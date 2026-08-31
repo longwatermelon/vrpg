@@ -164,8 +164,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, await deleteStory(id))
     }
     if (req.method === 'POST' && url.pathname === '/api/render') {
-      const { id } = await readJson(req)
-      return sendJson(res, 200, await renderStory(id))
+      const { id, choices } = await readJson(req)
+      return sendJson(res, 200, await renderStory(id, choices === true))
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(res, 200, getState())

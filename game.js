@@ -1,9 +1,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chatChoices, startScene, customChoice, parseChoices, getLlmCost } from './llm.js'
-import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob, getFalCost } from './fal.js'
-import { extractLastFrame, concatClips } from './media.js'
+import { chatChoices, startScene, customChoice, parseChoices } from './llm.js'
+import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob } from './fal.js'
+import { extractLastFrame, concatClips, concatClipsWithChoices } from './media.js'
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(ROOT, 'data')
@@ -49,6 +49,18 @@ let idleLoop = null // this turn's 5s idle loop render, best-effort
 
 let navClip = null // clip replayed by the last continue, keyed by token, so a lost response can still replay it
 
+let progress = null // weighted pipeline progress for the client loading bar
+
+// begin tracking a pipeline, weights are rough seconds per step
+function progressStart(weights) {
+  progress = { weights, step: 0, t: Date.now() }
+}
+
+// mark the current step done and start timing the next
+function progressStep() {
+  if (progress) { progress.step++; progress.t = Date.now() }
+}
+
 // forget the current idle loop, best-effort canceling a still-running render
 function dropIdleLoop() {
   if (idleLoop && !idleLoop.url && !idleLoop.failed) {
@@ -69,7 +81,7 @@ function startIdleLoopRender(s, tok) {
     const frameUri = toDataUri(s.frame)
     state.job = await submitJob(s.loopPrompt, frameUri, 5, frameUri) // same frame as start and end forces a closed loop
     if (state.aborted) return cancelJob(state.job) // dropped while submitting
-    await awaitJob(state.job, out)
+    await awaitJob(state.job, out, s.cost)
     state.url = toUrl(out)
   })().catch(() => { state.failed = true }) // no loop, the static frame stands; keep the entry so nothing resubmits
   return state.promise
@@ -87,6 +99,7 @@ async function exclusive(fn, wait = false) {
     return await fn()
   } finally {
     busy = false
+    progress = null // whatever pipeline ran is over, a stale bar must not show
   }
 }
 
@@ -112,7 +125,7 @@ async function nextTurn(s, text, frame) {
       { type: 'image_url', image_url: { url: toDataUri(frame) } },
     ],
   }
-  const { raw, choices, loopPrompt } = await chatChoices([...s.messages.map(stripImage), userMsg]) // only the new frame goes out
+  const { raw, choices, loopPrompt } = await chatChoices([...s.messages.map(stripImage), userMsg], s.cost) // only the new frame goes out
   return { msgs: [userMsg, { role: 'assistant', content: raw }], choices, loopPrompt }
 }
 
@@ -183,17 +196,43 @@ function positionState(s) {
   }
 }
 
-// running api spend for this process, exact for openrouter, rate-estimated for fal
+const costs = new Map() // one tracker per story dir, so a late charge from an abandoned render can't go stale
+
+// a story's cost tracker: llm.js and fal.js bill into it, every charge persists to
+// the story's cost.json immediately so no spend is lost to a failed turn or restart
+function makeCost(dir) {
+  if (costs.has(dir)) return costs.get(dir)
+  const file = path.join(dir, 'cost.json')
+  const c = { llm: 0, fal: 0 }
+  try { // resume the story's spend where it left off, older stories predate cost tracking
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (typeof d.llm === 'number' && typeof d.fal === 'number') { c.llm = d.llm; c.fal = d.fal }
+  } catch {}
+  c.bill = (kind, amount) => {
+    c[kind] += amount
+    try { // best-effort, memory stays right; atomic so a crash can't leave a torn file
+      fs.writeFileSync(file + '.tmp', JSON.stringify({ llm: c.llm, fal: c.fal }))
+      fs.renameSync(file + '.tmp', file)
+    } catch {}
+  }
+  costs.set(dir, c)
+  return c
+}
+
+// api spend of the active story, exact for openrouter, rate-estimated for fal
 function getCost() {
-  const llm = getLlmCost()
-  const fal = getFalCost()
+  const { llm, fal } = session?.cost || pendingStart?.cost || { llm: 0, fal: 0 } // cost always matches the story the rest of the state shows
   return { llm, fal, total: llm + fal }
 }
 
 // snapshot of the current session so the client can resync after a lost response
 export function getState() {
   const settling = busy || resetInFlight !== null // a queued reset counts as busy
-  if (!session) return { active: false, busy: settling, cost: getCost() }
+  // weighted step progress of the running pipeline, for the client loading bar
+  const prog = busy && progress
+    ? { weights: progress.weights, step: progress.step, elapsed: (Date.now() - progress.t) / 1000 }
+    : null
+  if (!session) return { active: false, busy: settling, cost: getCost(), progress: prog }
   return {
     active: true,
     busy: settling,
@@ -206,6 +245,7 @@ export function getState() {
     loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
     loopFailed: idleLoop?.token === token ? !!idleLoop.failed : true, // no loop entry means none is coming, stop waiting
     cost: getCost(),
+    progress: prog,
   }
 }
 
@@ -229,26 +269,31 @@ export function getDebug() {
 // start a new game from the player's context and character, returns the opening frame and choices
 export function startGame(context, player) {
   return exclusive(async () => {
-    // reuse the submitted job or finished opening frame if this is a retry of the same start
+    // reuse the paid steps of a previous attempt if this is a retry of the same start
     if (pendingStart?.context !== context || pendingStart?.player !== player) {
       const dir = path.join(DATA_DIR, String(Date.now()))
       fs.mkdirSync(dir, { recursive: true })
-      // flesh out the character and write the opening frame prompt before paying for the image
-      const { character, scene } = await startScene(context, player)
-      pendingStart = { context, player, character, scene, dir, job: await submitImageJob(scene) }
+      pendingStart = { context, player, dir, cost: makeCost(dir) } // tracker exists before the first paid call
     }
+    progressStart([8, 20, 10, 15]) // scene write, image gen, first turn llm, idle loop render
+    // flesh out the character and write the opening frame prompt before paying for the image
+    if (!pendingStart.scene) Object.assign(pendingStart, await startScene(context, player, pendingStart.cost))
+    progressStep() // scene written
+    if (!pendingStart.job) pendingStart.job = await submitImageJob(pendingStart.scene)
     const { dir, character, scene } = pendingStart
     if (!pendingStart.frame) {
       try {
-        pendingStart.frame = await awaitImageJob(pendingStart.job, path.join(dir, 'frame-0'))
+        pendingStart.frame = await awaitImageJob(pendingStart.job, path.join(dir, 'frame-0'), pendingStart.cost)
       } catch (err) {
-        if (err.terminal) pendingStart = null // job itself failed, a retry must resubmit
+        if (err.terminal) pendingStart.job = null // job itself failed, a retry resubmits it but keeps the paid steps
         throw err
       }
     }
+    progressStep() // opening frame ready
     const frame = pendingStart.frame
-    const candidate = { dir, turn: 0, frame, context, player, character, scenePrompt: scene, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
+    const candidate = { dir, turn: 0, frame, context, player, character, scenePrompt: scene, cost: pendingStart.cost, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
     const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
+    progressStep() // llm done, only the idle loop render remains
     applyTurn(candidate, turn, frame, 0)
     saveSession(candidate) // persist first so a failed save fails the start cleanly, memory untouched
     session = candidate // replace any previous game only once the opening turn succeeded
@@ -293,7 +338,7 @@ async function commitChoice(choice, custom) {
   const frame = path.join(session.dir, `frame-${session.turn + 1}.jpg`)
   if (!pendingRender.done) {
     try {
-      await awaitJob(pendingRender.job, clip)
+      await awaitJob(pendingRender.job, clip, session.cost)
     } catch (err) {
       if (err.terminal) pendingRender.job = null // job itself failed, a retry resubmits it but keeps the choice
       throw err
@@ -301,12 +346,14 @@ async function commitChoice(choice, custom) {
     await extractLastFrame(clip, frame)
     pendingRender.done = true
   }
+  progressStep() // clip rendered (or reused from a retry)
   // a custom choice's prompt lives nowhere in the transcript, so carry it in the user message;
   // preset prompts are already in the preceding assistant message
   const text = custom
     ? `Choose custom action: ${choice.label}\nThe action was rendered from this clip prompt: ${choice.prompt}\nAttached image is the last frame of where this chosen action left off.`
     : `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`
   const next = await nextTurn(session, text, frame)
+  progressStep() // llm done, only the idle loop render remains
   // stage the committed state on a copy and persist it before publishing in memory,
   // so a failed disk save leaves the turn cleanly retryable
   const committed = { ...session }
@@ -339,6 +386,7 @@ export function chooseOption(index, clientToken) {
       throw new Error(`a render for "${pendingRender.choice.label}" is already pending, retry that choice`)
     }
     if (pendingRender?.token !== token || pendingRender.key !== index) pendingRender = { token, key: index, choice, done: false }
+    progressStart([3 * choice.duration, 10, 15]) // clip render, next turn llm, idle loop render
     if (!pendingRender.job) pendingRender.job = await submitJob(choice.prompt, toDataUri(session.frame), choice.duration)
     return commitChoice(pendingRender.choice, false)
   })
@@ -355,10 +403,15 @@ export function chooseCustom(text, clientToken) {
       throw new Error(`a render for "${pendingRender.choice.label}" is already pending, retry that choice`)
     }
     if (pendingRender?.token !== token || pendingRender.key !== key) {
+      progressStart([8, 24, 10, 15]) // action write, clip render (weight refined below), llm, loop
       // the llm takes inspiration from the idea and writes a proper self-contained choice,
       // cached before the render submit so a submit failure never repeats the paid llm call
-      const choice = await customChoice(session.messages.map(stripImage), text, toDataUri(session.frame))
+      const choice = await customChoice(session.messages.map(stripImage), text, toDataUri(session.frame), session.cost)
       pendingRender = { token, key, choice, done: false }
+      progress.weights[1] = 3 * choice.duration // the real clip length is now known
+      progressStep() // action written
+    } else {
+      progressStart([3 * pendingRender.choice.duration, 10, 15]) // retry skips the write
     }
     if (!pendingRender.job) pendingRender.job = await submitJob(pendingRender.choice.prompt, toDataUri(session.frame), pendingRender.choice.duration)
     return commitChoice(pendingRender.choice, true)
@@ -466,7 +519,7 @@ export function truncateStory(turnNo, clientToken) {
     for (const name of fs.readdirSync(session.dir)) {
       const m = name.match(/^(frame|clip|loop)-(\d+)\.\w+$/)
       const cut = m && (m[1] === 'clip' ? parseInt(m[2]) >= turnNo : parseInt(m[2]) > turnNo)
-      if (cut || name === 'story.mp4') fs.rmSync(path.join(session.dir, name), { force: true }) // stitched render is stale too
+      if (cut || name === 'story.mp4' || name === 'story-choices.mp4') fs.rmSync(path.join(session.dir, name), { force: true }) // stitched renders are stale too
     }
     setDiskLoop(session.dir, turnNo)
     return { ...positionState(session), token }
@@ -543,6 +596,7 @@ export function loadStory(id) {
       messages: d.messages,
       choices: d.choices,
       loopPrompt: d.loopPrompt,
+      cost: makeCost(dir), // resumes the story's persisted spend
       loaded: true, // marks the saved clip as historical so resync won't replay it
     }
     if (!isFile(s.frame)) throw new Error('story frame is missing on disk')
@@ -568,13 +622,34 @@ export async function deleteStory(id) {
   if (renders.has(id)) throw new Error('story is being rendered, wait for it to finish')
   if (!fs.existsSync(dir)) throw new Error('story not found')
   fs.rmSync(dir, { recursive: true, force: true })
+  costs.delete(dir) // a deleted story's spend is gone with it
   return { ok: true }
 }
 
 const renders = new Map() // per-story render chain, serializes concurrent requests
 
-// stitch a story's main clips (loops excluded) into one downloadable mp4
-export function renderStory(id) {
+// per-clip choice ui specs for the overlay render, reconstructed from the saved transcript;
+// a clip whose turn can't be parsed gets null and renders bare
+function choiceOverlays(meta, clips) {
+  return clips.map(f => {
+    const k = fileNum(path.basename(f)) // clip-k leads out of turn k
+    const raw = meta.messages[2 + 2 * k]?.content // assistant response that offered turn k's choices
+    const parsed = typeof raw === 'string' ? parseChoices(raw) : null
+    if (!parsed) return null
+    const labels = parsed.choices.map(c => c.label)
+    const m = meta.messages[3 + 2 * k] // following user message holds the pick
+    const text = Array.isArray(m?.content) ? m.content.find(p => p.type === 'text')?.text : m?.content
+    const match = typeof text === 'string' ? text.match(/^Choose (?:custom action|option): (.*)/) : null
+    if (!match) return null
+    let picked = labels.indexOf(match[1])
+    if (picked < 0) { labels.push(match[1]); picked = labels.length - 1 } // custom action, shown as an extra option
+    return { labels, picked }
+  })
+}
+
+// stitch a story's main clips (loops excluded) into one downloadable mp4;
+// withChoices overlays each turn's options ui at its clip's start, picked one highlighted
+export function renderStory(id, withChoices = false) {
   const dir = storyDir(id)
   // run after any in-flight render for this story, then recheck freshness,
   // so a request made after a newer clip lands never gets a stale snapshot
@@ -584,19 +659,21 @@ export function renderStory(id) {
     const metaFile = path.join(dir, 'session.json')
     let meta = null // committed progress bound, a failed turn can leave an orphan clip
     try { meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')) } catch {}
+    if (withChoices && !Array.isArray(meta?.messages)) throw new Error('story has no saved transcript, the choices cannot be recovered')
     const started = Date.now() // clip list snapshot moment
     const clips = fs.readdirSync(dir)
       .filter(f => /^clip-\d+\.mp4$/.test(f) && (!meta || fileNum(f) < meta.turn))
       .sort((a, b) => fileNum(a) - fileNum(b))
       .map(f => path.join(dir, f))
     if (!clips.length) throw new Error('story has no clips to render')
-    const out = path.join(dir, 'story.mp4')
+    const out = path.join(dir, withChoices ? 'story-choices.mp4' : 'story.mp4')
     // reuse a previous render unless a newer clip or commit has landed since;
     // the commit check catches a clip excluded because its turn was still mid-save
     let newest = Math.max(...clips.map(f => fs.statSync(f).mtimeMs))
     if (meta) try { newest = Math.max(newest, fs.statSync(metaFile).mtimeMs) } catch {}
     if (!fs.existsSync(out) || fs.statSync(out).mtimeMs <= newest) {
-      await concatClips(clips, out)
+      if (withChoices) await concatClipsWithChoices(clips, choiceOverlays(meta, clips), out)
+      else await concatClips(clips, out)
       fs.utimesSync(out, new Date(started), new Date(started)) // a clip landing mid-render still reads as newer
     }
     return { url: toUrl(out) } // toUrl versions by mtime, the browser must not serve a stale cached render
