@@ -17,6 +17,21 @@
     <textarea id="character" rows="2" maxlength="500" placeholder="e.g. a wiry young woman with a scar over one eye, worn leather armor, red cloak"></textarea>
     <p>Describe the starting point of your story.</p>
     <textarea id="context" rows="4" maxlength="2000" placeholder="e.g. waking up in a medieval tavern with no memory, a hooded figure sitting across the table..."></textarea>
+    <!-- llm settings: openrouter model plus reasoning effort -->
+    <p>Model</p>
+    <div class="llm-settings">
+      <select class="model-select" title="openrouter model"></select>
+      <select class="effort-select" title="reasoning effort">
+        <option value="default">model default</option>
+        <option value="none">no reasoning</option>
+        <option value="minimal">minimal reasoning</option>
+        <option value="low">low reasoning</option>
+        <option value="medium">medium reasoning</option>
+        <option value="high">high reasoning</option>
+        <option value="xhigh">xhigh reasoning</option>
+        <option value="max">max reasoning</option>
+      </select>
+    </div>
     <button id="begin">Begin</button>
 
     <!-- past stories: resume, render to video, or delete saved runs -->
@@ -51,6 +66,20 @@
       </div>
       <div id="timeline"></div>
       <div id="sidebar-bottom">
+        <!-- llm settings: switching mid-game applies from the next turn -->
+        <div class="llm-settings">
+          <select class="model-select" title="openrouter model"></select>
+          <select class="effort-select" title="reasoning effort">
+            <option value="default">model default</option>
+            <option value="none">no reasoning</option>
+            <option value="minimal">minimal reasoning</option>
+            <option value="low">low reasoning</option>
+            <option value="medium">medium reasoning</option>
+            <option value="high">high reasoning</option>
+            <option value="xhigh">xhigh reasoning</option>
+            <option value="max">max reasoning</option>
+          </select>
+        </div>
         <!-- cost tracker: the active story's api spend -->
         <div id="cost" hidden>
           <span>llm</span><span class="amt" id="cost-llm"></span>

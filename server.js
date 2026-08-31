@@ -16,7 +16,40 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, chooseCustom, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory } = await import('./game.js') // import after env is loaded
+const { startGame, chooseOption, chooseCustom, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory, isBusy } = await import('./game.js') // import after env is loaded
+const { getSettings, setSettings, normalizeSettings, listModels, getSelectableModel, EFFORTS, isValidModel } = await import('./llm.js')
+
+// serialize settings validation and writes so concurrent tabs can't combine stale fields
+let settingsWork = Promise.resolve()
+function withSettingsLock(fn) {
+  const run = settingsWork.then(fn)
+  settingsWork = run.catch(() => {})
+  return run
+}
+
+function apiError(status, message) {
+  const err = new Error(message)
+  err.status = status
+  return err
+}
+
+async function applySettings(model, effort) {
+  if (isBusy()) throw apiError(409, 'a turn is in progress, change settings once it finishes')
+  const current = getSettings()
+  const selected = await getSelectableModel(model === undefined ? current.model : model)
+  if (model !== undefined && !selected) throw apiError(400, 'model must support image input and structured text output')
+  let nextEffort = effort === undefined ? current.effort : effort
+  if (!selected?.efforts.includes(nextEffort)) {
+    if (effort !== undefined && effort !== 'default') throw apiError(400, 'reasoning effort is not supported by this model')
+    nextEffort = 'default' // a model change resets an incompatible old effort
+  }
+  if (isBusy()) throw apiError(409, 'a turn started while settings were being checked, try again once it finishes')
+  return setSettings({ model, effort: nextEffort, reasoning: selected?.reasoning })
+}
+
+function readySettings() {
+  return withSettingsLock(normalizeSettings)
+}
 
 const MIME = {
   '.html': 'text/html',
@@ -120,16 +153,19 @@ const server = http.createServer(async (req, res) => {
       if (typeof character !== 'string' || !character.trim()) return sendJson(res, 400, { error: 'character is required' })
       if (context.length > 2000) return sendJson(res, 400, { error: 'context too long, keep it under 2000 characters' })
       if (character.length > 500) return sendJson(res, 400, { error: 'character too long, keep it under 500 characters' })
+      await readySettings()
       return sendJson(res, 200, await startGame(context.trim(), character.trim()))
     }
     if (req.method === 'POST' && url.pathname === '/api/choose') {
       const { index, token } = await readJson(req)
+      await readySettings()
       return sendJson(res, 200, await chooseOption(index, token))
     }
     if (req.method === 'POST' && url.pathname === '/api/choose-custom') {
       const { text, token } = await readJson(req)
       if (typeof text !== 'string' || !text.trim()) return sendJson(res, 400, { error: 'text is required' })
       if (text.length > 300) return sendJson(res, 400, { error: 'idea too long, keep it under 300 characters' })
+      await readySettings()
       return sendJson(res, 200, await chooseCustom(text.trim(), token))
     }
     if (req.method === 'GET' && url.pathname === '/api/timeline') {
@@ -166,6 +202,18 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/render') {
       const { id, choices } = await readJson(req)
       return sendJson(res, 200, await renderStory(id, choices === true))
+    }
+    if (req.method === 'GET' && url.pathname === '/api/settings') {
+      return sendJson(res, 200, await readySettings())
+    }
+    if (req.method === 'POST' && url.pathname === '/api/settings') {
+      const { model, effort } = await readJson(req)
+      if (model !== undefined && !isValidModel(model)) return sendJson(res, 400, { error: 'invalid model' })
+      if (effort !== undefined && !EFFORTS.includes(effort)) return sendJson(res, 400, { error: 'invalid effort' })
+      return sendJson(res, 200, await withSettingsLock(() => applySettings(model, effort)))
+    }
+    if (req.method === 'GET' && url.pathname === '/api/models') {
+      return sendJson(res, 200, { models: await listModels() })
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(res, 200, getState())

@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chatChoices, startScene, customChoice, parseChoices } from './llm.js'
+import { chatChoices, startScene, customChoice, parseChoices, getLlmSettings } from './llm.js'
 import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob } from './fal.js'
 import { extractLastFrame, concatClips, concatClipsWithChoices } from './media.js'
 
@@ -119,7 +119,7 @@ function toUrl(file) {
 }
 
 // ask the llm for the next choices given a user message with a frame attached, no mutation of s
-async function nextTurn(s, text, frame) {
+async function nextTurn(s, text, frame, llmSettings) {
   const userMsg = {
     role: 'user',
     content: [
@@ -127,7 +127,7 @@ async function nextTurn(s, text, frame) {
       { type: 'image_url', image_url: { url: toDataUri(frame) } },
     ],
   }
-  const { raw, choices, loopPrompt } = await chatChoices([...s.messages.map(stripImage), userMsg], s.cost) // only the new frame goes out
+  const { raw, choices, loopPrompt } = await chatChoices([...s.messages.map(stripImage), userMsg], s.cost, llmSettings) // only the new frame goes out
   return { msgs: [userMsg, { role: 'assistant', content: raw }], choices, loopPrompt }
 }
 
@@ -227,6 +227,12 @@ function getCost() {
   return { llm, fal, total: llm + fal }
 }
 
+// whether a game operation is running, settings changes are rejected meanwhile
+// so one turn can't mix two models or efforts across its llm calls
+export function isBusy() {
+  return busy || !!resetInFlight
+}
+
 // snapshot of the current session so the client can resync after a lost response
 export function getState() {
   const settling = busy || resetInFlight !== null // a queued reset counts as busy
@@ -275,11 +281,11 @@ export function startGame(context, player) {
     if (pendingStart?.context !== context || pendingStart?.player !== player) {
       const dir = path.join(DATA_DIR, String(Date.now()))
       fs.mkdirSync(dir, { recursive: true })
-      pendingStart = { context, player, dir, cost: makeCost(dir) } // tracker exists before the first paid call
+      pendingStart = { context, player, dir, cost: makeCost(dir), llmSettings: getLlmSettings() } // tracker and llm snapshot exist before the first paid call
     }
     progressStart([8, 20, 10, 15]) // scene write, image gen, first turn llm, idle loop render
     // flesh out the character and write the opening frame prompt before paying for the image
-    if (!pendingStart.scene) Object.assign(pendingStart, await startScene(context, player, pendingStart.cost))
+    if (!pendingStart.scene) Object.assign(pendingStart, await startScene(context, player, pendingStart.cost, pendingStart.llmSettings))
     progressStep() // scene written
     if (!pendingStart.job) pendingStart.job = await submitImageJob(pendingStart.scene)
     const { dir, character, scene } = pendingStart
@@ -294,7 +300,7 @@ export function startGame(context, player) {
     progressStep() // opening frame ready
     const frame = pendingStart.frame
     const candidate = { dir, turn: 0, frame, context, player, character, scenePrompt: scene, cost: pendingStart.cost, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
-    const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame)
+    const turn = await nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame, pendingStart.llmSettings)
     progressStep() // llm done, only the idle loop render remains
     applyTurn(candidate, turn, frame, 0)
     saveSession(candidate) // persist first so a failed save fails the start cleanly, memory untouched
@@ -354,7 +360,7 @@ async function commitChoice(choice, custom) {
   const text = custom
     ? `Choose custom action: ${choice.label}\nThe action was rendered from this clip prompt: ${choice.prompt}\nAttached image is the last frame of where this chosen action left off.`
     : `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`
-  const next = await nextTurn(session, text, frame)
+  const next = await nextTurn(session, text, frame, pendingRender.llmSettings)
   progressStep() // llm done, only the idle loop render remains
   // stage the committed state on a copy and persist it before publishing in memory,
   // so a failed disk save leaves the turn cleanly retryable
@@ -387,7 +393,7 @@ export function chooseOption(index, clientToken) {
     if (pendingRender?.token === token && pendingRender.key !== index && pendingRender.job) {
       throw new Error(`a render for "${pendingRender.choice.label}" is already pending, retry that choice`)
     }
-    if (pendingRender?.token !== token || pendingRender.key !== index) pendingRender = { token, key: index, choice, done: false }
+    if (pendingRender?.token !== token || pendingRender.key !== index) pendingRender = { token, key: index, choice, done: false, llmSettings: getLlmSettings() }
     progressStart([3 * choice.duration, 10, 15]) // clip render, next turn llm, idle loop render
     if (!pendingRender.job) pendingRender.job = await submitJob(choice.prompt, toDataUri(session.frame), choice.duration)
     return commitChoice(pendingRender.choice, false)
@@ -406,10 +412,11 @@ export function chooseCustom(text, clientToken) {
     }
     if (pendingRender?.token !== token || pendingRender.key !== key) {
       progressStart([8, 24, 10, 15]) // action write, clip render (weight refined below), llm, loop
+      const llmSettings = getLlmSettings() // one snapshot writes the custom action and the following choices, including retries
       // the llm takes inspiration from the idea and writes a proper self-contained choice,
       // cached before the render submit so a submit failure never repeats the paid llm call
-      const choice = await customChoice(session.messages.map(stripImage), text, toDataUri(session.frame), session.cost)
-      pendingRender = { token, key, choice, done: false }
+      const choice = await customChoice(session.messages.map(stripImage), text, toDataUri(session.frame), session.cost, llmSettings)
+      pendingRender = { token, key, choice, done: false, llmSettings }
       progress.weights[1] = 3 * choice.duration // the real clip length is now known
       progressStep() // action written
     } else {

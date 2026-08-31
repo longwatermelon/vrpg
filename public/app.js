@@ -150,6 +150,121 @@ async function loadCost() {
   try { renderCost((await (await fetch('/api/state')).json()).cost) } catch {}
 }
 
+let modelInfo = new Map() // model id -> supported reasoning efforts, from /api/models
+
+const effortLabels = {
+  default: 'model default',
+  none: 'no reasoning',
+  minimal: 'minimal reasoning',
+  low: 'low reasoning',
+  medium: 'medium reasoning',
+  high: 'high reasoning',
+  xhigh: 'xhigh reasoning',
+  max: 'max reasoning',
+}
+
+// set a model select to a value, creating the option when the list doesn't have it
+// (the saved model may predate the fetched list, or the list may not be loaded yet)
+function setModelValue(el, model) {
+  if (model && ![...el.options].some(o => o.value === model)) {
+    const opt = document.createElement('option')
+    opt.value = opt.textContent = model
+    el.appendChild(opt)
+  }
+  el.value = model
+}
+
+// fill every settings control (start screen and sidebar) with the given llm settings
+function renderSettings(s) {
+  for (const el of document.querySelectorAll('.model-select')) setModelValue(el, s.model)
+  for (const el of document.querySelectorAll('.effort-select')) el.value = s.effort
+  updateEffortOptions()
+}
+
+// show only efforts the picked model exposes; unknown models keep the existing options
+function updateEffortOptions() {
+  const model = document.querySelector('.model-select').value
+  const efforts = modelInfo.get(model)?.efforts
+  if (!efforts) return
+  for (const el of document.querySelectorAll('.effort-select')) {
+    const current = el.value
+    el.innerHTML = ''
+    for (const effort of efforts) {
+      const opt = document.createElement('option')
+      opt.value = effort
+      opt.textContent = effortLabels[effort]
+      el.appendChild(opt)
+    }
+    el.value = efforts.includes(current) ? current : 'default'
+    el.hidden = efforts.length === 1
+  }
+}
+
+let settingsGen = 0 // bumped per fetch or save so only the latest result renders
+
+// fetch the current llm settings into the controls, only rendering while still the latest change
+// returns whether the fetch succeeded, so recovery flows know the controls are in sync
+async function loadSettings(gen = ++settingsGen) {
+  try {
+    const res = await fetch('/api/settings')
+    if (!res.ok) return false // an error body must not render as settings
+    const s = await res.json()
+    if (gen === settingsGen) renderSettings(s) // superseded, don't touch the controls
+    return true
+  } catch { return false }
+}
+
+// initial load and later saves are awaited before paid llm calls; resolves false on failure
+let settingsPending
+
+// retry a failed initial/recovery fetch whenever the player next requests a paid action
+async function settingsReady() {
+  if (await settingsPending) return true
+  settingsPending = loadSettings()
+  return settingsPending
+}
+
+// save a changed setting and mirror the result into all controls
+// saves chain onto each other so an older response can't overwrite a newer one
+function saveSettings(patch) {
+  const gen = ++settingsGen // claimed at enqueue, an older queued save can't outrank this one
+  const p = settingsPending.then(async () => {
+    try {
+      const s = await api('/api/settings', patch)
+      if (gen === settingsGen) renderSettings(s)
+      return true
+    } catch (err) {
+      alert(err.message)
+      return false
+    }
+  })
+  settingsPending = p
+  // no newer save queued: restore the server's settings, and once the controls are
+  // back in sync reopen the gate so later actions aren't cancelled forever
+  // (a failed reload keeps it closed, the controls may still show unsaved values)
+  p.then(ok => { if (!ok && p === settingsPending) settingsPending = loadSettings() })
+  return p
+}
+
+// fill both model dropdowns from openrouter's model list, keeping the current selection
+async function loadModels() {
+  try {
+    const { models } = await (await fetch('/api/models')).json()
+    modelInfo = new Map(models.map(m => [m.id, m]))
+    for (const el of document.querySelectorAll('.model-select')) {
+      const cur = el.value // keep the selection across the rebuild
+      el.innerHTML = ''
+      for (const m of models) {
+        const opt = document.createElement('option')
+        opt.value = opt.textContent = m.id
+        el.appendChild(opt)
+      }
+      setModelValue(el, cur)
+    }
+    updateEffortOptions() // capability of the already-selected model is now known
+  } catch {} // list unavailable, the selects keep whatever the settings load put in
+}
+
 let devGen = 0 // bumped to invalidate stale dev panel fetches
 let devToken = null // turn token the panel currently shows, avoids duplicate fetches per turn
 
@@ -562,6 +677,12 @@ async function begin() {
     if (state.active) baseline = state.token
   } catch {}
   if (gen !== uiGen) return // restarted meanwhile, don't start a game the ui already left
+  const saved = await settingsReady() // a just-changed model must reach the server before the paid call
+  if (gen !== uiGen) return // restarted while waiting out the save
+  if (!saved) { // settings are unknown, don't start a paid game under an accidental model
+    toStartScreen()
+    return alert('Could not load model settings')
+  }
   let data
   try {
     data = await api('/api/start', { context, character })
@@ -607,6 +728,15 @@ async function advanceTurnInner(label, request, restore, picked) {
   setChoicesDisabled(true)
   if (picked !== undefined) showPending(picked)
   const done = label ? startTimer(label) : () => setStatus('') // instant actions get no timer
+  if (label) { // free actions (continue) skip the gate, they never touch the llm
+    const saved = await settingsReady() // a just-changed model must reach the server before the paid call
+    if (gen !== uiGen) return // restarted while waiting out the save
+    if (!saved) { // the save failed, don't run a paid turn under stale settings
+      setStatus('Could not load model settings, action cancelled', true)
+      restore()
+      return
+    }
+  }
   let data
   try {
     data = await request() // the idle loop keeps playing meanwhile
@@ -817,6 +947,16 @@ $('restart').onclick = restart
 $('timeline-toggle').onclick = () => toggleSidebar()
 $('sidebar-close').onclick = () => toggleSidebar(false)
 $('dev').ontoggle = () => { if ($('dev').open) loadDev(true) } // always fetch fresh prompts on open
+
+// wire both settings control sets
+for (const el of document.querySelectorAll('.model-select')) {
+  el.onchange = () => saveSettings({ model: el.value })
+}
+for (const el of document.querySelectorAll('.effort-select')) {
+  el.onchange = () => saveSettings({ effort: el.value })
+}
+settingsPending = loadSettings()
+loadModels()
 
 // rejoin an active game after a page refresh
 async function init() {
