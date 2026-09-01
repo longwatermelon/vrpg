@@ -162,15 +162,15 @@ const RESPONSE_FORMAT = {
             properties: {
               label: { type: 'string' },
               prompt: { type: 'string' },
-              duration: { type: 'integer', minimum: 5, maximum: 15 },
+              duration: { type: 'integer', minimum: 8, maximum: 15 },
+              'loop-prompt': { type: 'string' },
             },
-            required: ['label', 'prompt', 'duration'],
+            required: ['label', 'prompt', 'duration', 'loop-prompt'],
             additionalProperties: false,
           },
         },
-        'loop-prompt': { type: 'string' },
       },
-      required: ['choices', 'loop-prompt'],
+      required: ['choices'],
       additionalProperties: false,
     },
   },
@@ -214,17 +214,20 @@ function parseJson(raw) {
   try { return JSON.parse(text) } catch { return null }
 }
 
-// parse and validate the choices json plus idle loop prompt from raw llm output, null if invalid
+// parse and validate the choices json from raw llm output, null if invalid
 // exported so a saved assistant message can be re-parsed when the timeline is truncated
-export function parseChoices(raw) {
+// live responses must carry a per-choice loop-prompt; saved messages may lack it, and
+// duration accepts down to 5, for stories saved under older rules
+export function parseChoices(raw, live = false) {
   const obj = parseJson(raw)
   const choices = obj?.choices
+  const loopOk = c => typeof c['loop-prompt'] === 'string' && c['loop-prompt'].trim()
   if (Array.isArray(choices) && choices.length >= 2 && choices.length <= 3 &&
       choices.every(c => typeof c.label === 'string' && c.label.trim() &&
                          typeof c.prompt === 'string' && c.prompt.trim() &&
-                         Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15) &&
-      typeof obj['loop-prompt'] === 'string' && obj['loop-prompt'].trim()) {
-    return { choices, loopPrompt: obj['loop-prompt'] }
+                         (live ? loopOk(c) : c['loop-prompt'] === undefined || loopOk(c)) &&
+                         Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15)) {
+    return { choices, loopPrompt: typeof obj['loop-prompt'] === 'string' && obj['loop-prompt'].trim() ? obj['loop-prompt'] : null }
   }
   return null
 }
@@ -245,10 +248,55 @@ async function completeJson(messages, format, parse, what, cost, config = settin
   return { raw, out }
 }
 
-// get the next set of choices plus idle loop prompt from the llm, retrying once on bad json
+// get the next set of choices from the llm, retrying once on bad json
 export async function chatChoices(messages, cost, config = settings) {
-  const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, parseChoices, 'choices', cost, config)
-  return { raw, choices: out.choices, loopPrompt: out.loopPrompt }
+  const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, r => parseChoices(r, true), 'choices', cost, config)
+  return { raw, choices: out.choices }
+}
+
+// strict schema for the idle loop prompt call
+const LOOP_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'loop',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: { 'loop-prompt': { type: 'string' } },
+      required: ['loop-prompt'],
+      additionalProperties: false,
+    },
+  },
+}
+
+// parse and validate the loop prompt json, null if invalid
+function parseLoop(raw) {
+  const obj = parseJson(raw)
+  return typeof obj?.['loop-prompt'] === 'string' && obj['loop-prompt'].trim() ? { loopPrompt: obj['loop-prompt'] } : null
+}
+
+// effort that turns reasoning off for the quick loop call: none when the model
+// allows it, the model default when reasoning is mandatory or unsupported
+async function loopEffort(config) {
+  if (!config.reasoning) return 'default' // model takes no reasoning param, nothing to turn off
+  const models = await fetchModels().catch(() => null)
+  const m = models?.find(x => x.id === config.model)
+  return m && modelEfforts(m).includes('none') ? 'none' : 'default'
+}
+
+// write the idle loop prompt for the opening frame, a quick reasoning-off call on the same transcript
+// turn loops are baked into each choice instead, this call only serves the start
+export async function writeLoopPrompt(messages, frameUri, cost, config = settings) {
+  const ask = {
+    role: 'user',
+    content: [
+      { type: 'text', text: `The attached image is the frame where the story now stands. Write a prompt for a 5-second idle animation starting from this frame, shown looping while the player picks their next option. Continue whatever repeatable action the characters are currently doing. For example, if they're walking with a repeatable background (ie, a wall or a crowd or a streetside), keep them walking against that background. If a character is typing, keep them typing. If a character is drinking, keep them drinking. Use natural, loopable actions that don't make it obvious a loop is occurring. Loops may also be action scenes, not just idle rote actions; for example, if the frame is in the middle of a high-action fighting scene, the loop can continue the fighting, as long as the net result of the fighting over the 5 seconds is basically "nothing was achieved overall, nothing truly progressed". The loop must not perform any of the player's choices or advance the story. Like a clip prompt, it must be self-contained: the video model sees only this frame and the prompt, so re-describe characters by appearance. The camera stays roughly still and the animation ends with everything back exactly at its starting pose so it loops seamlessly.\nRespond with ONLY a JSON object: {"loop-prompt": "..."}` },
+      { type: 'image_url', image_url: { url: frameUri } },
+    ],
+  }
+  const effort = await loopEffort(config)
+  const { out } = await completeJson([...messages, ask], LOOP_FORMAT, parseLoop, 'loop prompt', cost, { ...config, effort })
+  return out.loopPrompt
 }
 
 // strict schema for a single choice written from the player's own idea
@@ -262,9 +310,10 @@ const CUSTOM_FORMAT = {
       properties: {
         label: { type: 'string' },
         prompt: { type: 'string' },
-        duration: { type: 'integer', minimum: 5, maximum: 15 },
+        duration: { type: 'integer', minimum: 8, maximum: 15 },
+        'loop-prompt': { type: 'string' },
       },
-      required: ['label', 'prompt', 'duration'],
+      required: ['label', 'prompt', 'duration', 'loop-prompt'],
       additionalProperties: false,
     },
   },
@@ -275,8 +324,9 @@ function parseCustom(raw) {
   const c = parseJson(raw)
   if (c && typeof c.label === 'string' && c.label.trim() &&
       typeof c.prompt === 'string' && c.prompt.trim() &&
-      Number.isInteger(c.duration) && c.duration >= 5 && c.duration <= 15) {
-    return { label: c.label.trim(), prompt: c.prompt, duration: c.duration }
+      typeof c['loop-prompt'] === 'string' && c['loop-prompt'].trim() &&
+      Number.isInteger(c.duration) && c.duration >= 8 && c.duration <= 15) {
+    return { label: c.label.trim(), prompt: c.prompt, duration: c.duration, 'loop-prompt': c['loop-prompt'] }
   }
   return null
 }
@@ -286,7 +336,7 @@ export async function customChoice(messages, idea, frameUri, cost, config = sett
   const ask = {
     role: 'user',
     content: [
-      { type: 'text', text: `The player typed their own idea for what to do next: "${idea}"\n\nTake inspiration from that idea and turn it into one concrete choice: a short label plus a video clip prompt and duration following the same rules as your "choices" entries. Stay grounded in the current scene; if the idea doesn't quite fit, adapt its spirit into something that does. Do not offer regular choices for this message. Respond with ONLY a JSON object: {"label": "...", "prompt": "...", "duration": 8}\nAttached image is the current frame the clip will start from.` },
+      { type: 'text', text: `The player typed their own idea for what to do next: "${idea}"\n\nTake inspiration from that idea and turn it into one concrete choice: a short label plus a video clip prompt, duration, and loop-prompt following the same rules as your "choices" entries. Stay grounded in the current scene; if the idea doesn't quite fit, adapt its spirit into something that does. Do not offer regular choices for this message. Respond with ONLY a JSON object: {"label": "...", "prompt": "...", "duration": 8, "loop-prompt": "..."}\nAttached image is the current frame the clip will start from.` },
       { type: 'image_url', image_url: { url: frameUri } },
     ],
   }

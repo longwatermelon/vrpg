@@ -10,13 +10,14 @@ The player controls one character in the story, described by them at the start. 
 
 First, the player fills in two textboxes: a description of the character they'll control, and the basic context or starting point of the story. A setup LLM call fleshes the character description into a concrete visual description (what a camera can see, no name or backstory) and writes the opening frame prompt: a third-person shot of the starting scene with the player character in it. That prompt is used by an image model to generate the starting frame (Seedream 4.5 via Fal), which will be fed to the story LLM as an attachment on the first user message. The fleshed-out character description goes into the story LLM's system prompt so every clip prompt can re-describe the character consistently.
 
-The static opening frame normally stays hidden: the start call waits until the frame's 5s idle loop (from the opening turn's `loop-prompt`) is also rendered, and the client puts that loop on stage together with the first choices — so the first thing the player sees is the scene already in motion, without the story being advanced for them. The frame is shown only if the loop cannot render or play. From there the player is in the main game loop, which consists of the following steps:
+The static opening frame normally stays hidden: the start call waits until the frame's 5s idle loop is also rendered, and the client puts that loop on stage together with the first choices — so the first thing the player sees is the scene already in motion, without the story being advanced for them. The frame is shown only if the loop cannot render or play. From there the player is in the main game loop, which consists of the following steps:
   * LLM generates 2-3 options for the player to take in the LLM chat as its response, formatted as json. Options displayed on screen.
   * Player clicks on one option; the label of that choice gets inserted into the user message (ie "Eat the sandwich", "Say: \"What are you doing here?\"", etc).
   * Video model renders clip starting from current paused frame.
     - Note: rendered clip must preserve continuity. Start from the last frame of the previous clip. All characters, settings, objects, etc. should stay consistent.
-    - After the clip renders, a 5s idle loop of its last frame is also rendered (from the new turn's top-level `loop-prompt`) and the turn isn't returned until both are done — seamlessness over latency. The loop plays on repeat from the moment the clip ends and the options are up, through the next render wait. When the next clip is ready, the current loop cycle finishes first — the loop ends on its start keyframe, which is also the clip's start keyframe — so the cut is seamless. The loop is best-effort: if its render fails, the static frame stands.
-  * Clip plays once rendered, pauses at its last frame. Attach the last frame of that clip to the user message.
+    - The clip is delivered and starts playing the moment it's rendered; everything else happens behind it. The chosen option's baked-in `loop-prompt` kicks off a 5s idle loop render of the clip's last frame immediately, and in parallel the next-choices LLM call runs. Clips are a minimum of 8s, so both usually finish behind the playback.
+    - The loop plays on repeat from the moment it's rendered (the clip's frozen last frame stands until then), through the next render wait. When the next clip is ready, the current loop cycle finishes first — the loop ends on its start keyframe, which is also the clip's start keyframe — so the cut is seamless. The loop is best-effort: if its render fails, the static frame stands.
+  * Clip plays once rendered, pauses at its last frame. If the next choices aren't written yet when the clip ends, a spinner ("Thinking about next choices...") shows until they land; if that LLM call fails, a Retry button re-runs it against the already-rendered clip. Attach the last frame of that clip to the user message.
 
 So the user message is structured as `Choose option: <option label>\nAttached image is the last frame of where this chosen action left off.` with the frozen frame attached as an image. The LLM reads this and decides what options come next.
 
@@ -28,25 +29,26 @@ So the user message is structured as `Choose option: <option label>\nAttached im
     {
       "label": "Eat your girlfriend's sandwich",
       "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie.",
-      "duration": 8
+      "duration": 8,
+      "loop-prompt": "The man in the gray hoodie sits at the restaurant table chewing slowly, avoiding eye contact with the woman across from him, who glares at him with her arms crossed. The camera stays still and both end back exactly at their starting poses."
     },
     {
       "label": "Call the waiter over",
       "prompt": "The man in the gray hoodie sitting at the table raises his hand, and a middle-aged man in a white apron (currently off-screen) walks into view and stops beside the table, saying <d>[English] What can I get you?</d>. End state: the man in the white apron stands beside the table holding a notepad, the woman watching him.".,
-      "duration": 8
+      "duration": 8,
+      "loop-prompt": "The middle-aged man in the white apron stands beside the table holding a notepad, pen ready; the man in the gray hoodie glances over the menu while the woman across from him watches the waiter. The camera stays still and everyone ends back exactly at their starting poses."
     }
-  ],
-  "loop-prompt": "A tall young man with short brown hair in a gray hoodie and a young woman sit facing each other at a restaurant table. The camera stays still. They idle in place, breathing softly and glancing around. By the end both have returned exactly to their starting poses."
+  ]
 }
 ```
 
-Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; nothing is prepended. The `duration` field is the clip length in seconds, chosen by the LLM as an integer 5-15 (5 for a short one-shot action, 7-12 default, 15 for dialogue/fights/explanations) and passed straight to the video model. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
+Use start keyframe = current frozen frame, send the prompt field directly to the video model along with the start keyframe; nothing is prepended. The `duration` field is the clip length in seconds, chosen by the LLM as an integer 8-15 and passed straight to the video model. The video it returns is the clip that gets played; extract the last frame of the video as the current frozen frame.
 
-The top-level `loop-prompt` field describes a 5s idle animation of the current frame (the one the choices are offered on): camera roughly still, characters doing subtle believable idle motion, ending back exactly at the start pose so it loops seamlessly. It renders with duration 5 and the current frame as both start keyframe and `end_image_url`, forcing the loop closed. The choose turn only returns once both the main clip and this loop are rendered, so the loop is guaranteed ready when the clip finishes playing. The opening turn waits the same way: the start call only returns once its loop is rendered, and the client stages the loop with the first choices (the static frame is only a failure fallback).
+Each choice carries its own `loop-prompt`, written by the story LLM alongside the clip prompt from that choice's intended end state (no extra LLM call sits ahead of the loop render). It describes a 5s idle animation of the frame the clip ends on (the one the choices are offered on): camera roughly still, characters doing subtle believable idle motion, ending back exactly at the start pose so it loops seamlessly. The moment the chosen clip renders and its last frame is extracted, the loop render starts with duration 5 and that frame as both start keyframe and `end_image_url`, forcing the loop closed. Neither the loop nor the choices block the clip: the loop goes on stage whenever its render finishes, and the choices appear whenever their call finishes — the two are independent. The opening turn is the exception: its loop prompt still comes from its own quick LLM call (same transcript plus the opening frame, reasoning forced off — effort `none` when the model allows it, model default otherwise), since no choice describes the opening frame and the start is allowed to be slow — the start call returns once its loop is rendered, and the client stages the loop with the first choices (the static frame is only a failure fallback).
 
 ## Custom actions
 
-Besides the 2-3 offered choices, the player can type their own idea into a fourth box. An extra LLM call (same transcript plus the current frame) takes *inspiration* from the idea and writes one concrete choice (label, prompt, duration) following the normal prompt rules; the turn then proceeds exactly like a preset choice, with `Choose custom action: <label>` as the user message.
+Besides the 2-3 offered choices, the player can type their own idea into a fourth box. An extra LLM call (same transcript plus the current frame) takes *inspiration* from the idea and writes one concrete choice (label, prompt, duration, loop-prompt) following the normal prompt rules; the turn then proceeds exactly like a preset choice, with `Choose custom action: <label>` as the user message.
 
 ## Timeline
 

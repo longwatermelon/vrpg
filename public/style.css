@@ -293,6 +293,28 @@ textarea:focus-visible {
   transition: width 0.25s linear;
 }
 
+/* thinking spinner while the next choices generate behind the clip */
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink);
+  font-family: var(--display);
+  font-size: 1.15rem;
+  animation: rise 0.4s ease backwards;
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(236, 232, 223, 0.2);
+  border-top-color: var(--ember);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
 /* narrow screens: drop the status below the corner elements so they can't overlap */
 @media (max-width: 600px) {
   #status {

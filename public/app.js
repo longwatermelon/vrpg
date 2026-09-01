@@ -129,10 +129,138 @@ function renderContinue() {
   turnUiTail()
 }
 
-// choices at the tip of the timeline, a bare continue while browsing history
+// choices at the tip, a bare continue while browsing history, a spinner while the llm still writes
 function renderTurnUi(labels, mode, idea = '') {
   if (mode === 'continue') renderContinue()
+  else if (mode === 'pending') renderThinking()
   else renderChoices(labels, idea)
+}
+
+// pending-choices ui: polls the server until the turn's choices land; the spinner only
+// paints once a check confirms they're still pending, so a committed turn shows no flash
+function renderThinking(poll = true) {
+  if (poll) pollChoices()
+  else paintThinking()
+}
+
+const THINKING_ESTIMATE = 35 // rough seconds a choices generation takes, drives the thinking bar
+
+// paint the spinner into the choices area, with a loading bar against a flat time estimate
+// elapsed is how long the generation has already been running, so a bar shown
+// mid-load (it kicks off behind the clip playback) starts partway through
+function paintThinking(elapsed = 0) {
+  const box = $('choices')
+  box.innerHTML = ''
+  box.classList.add('pending')
+  const wrap = document.createElement('div')
+  wrap.className = 'thinking'
+  const spin = document.createElement('div')
+  spin.className = 'spinner'
+  const label = document.createElement('span')
+  label.textContent = 'Thinking about next choices...'
+  wrap.append(spin, label)
+  box.appendChild(wrap)
+  const bar = document.createElement('div')
+  bar.className = 'bar'
+  const fill = document.createElement('div')
+  fill.className = 'bar-fill'
+  bar.appendChild(fill)
+  box.appendChild(bar)
+  const rebase = startThinkingBar(fill, elapsed)
+  turnUiTail() // the idle loop should take the stage during the wait
+  return rebase
+}
+
+// animate the thinking bar from the generation's real start until it leaves the dom
+// returns a fn that rebases the bar onto the server's real elapsed time
+function startThinkingBar(fill, elapsed) {
+  let start = Date.now() - elapsed * 1000 // the generation began before the bar was shown
+  const draw = () => { fill.style.width = `${Math.min((Date.now() - start) / 1000 / THINKING_ESTIMATE, 0.98) * 100}%` }
+  draw() // show the progress already made immediately
+  const id = setInterval(() => {
+    if (!fill.isConnected) return clearInterval(id) // bar replaced, done
+    draw()
+  }, 250)
+  return e => { start = Date.now() - e * 1000; draw() }
+}
+
+// poll the server until the pending turn's choices land, then render them
+async function pollChoices() {
+  const gen = uiGen
+  const myToken = currentToken
+  let painted = false
+  let rebase = null // set when the bar was painted before any state arrived, to sync it later
+  for (;;) {
+    let state = null
+    try { state = await (await fetch('/api/state')).json() } catch {} // transient, try again
+    if (gen !== uiGen || currentToken !== myToken) return // superseded by another flow
+    if (state) {
+      if (!state.active) return toStartScreen() // reset from another tab
+      if (state.token !== myToken) return resync().catch(() => {}) // the game advanced elsewhere, sync to it
+      renderCost(state.cost)
+      if (state.turnError) return renderRetry(state.turnError)
+      if (state.mode !== 'pending') {
+        devToken = null // same token but new prompts, an open dev panel must refetch
+        return renderChoices(state.choices)
+      }
+      if (rebase) { rebase(state.thinkingElapsed || 0); rebase = null } // bar painted blind, sync it to the real progress
+    }
+    if (!painted) {
+      painted = true
+      const r = paintThinking(state?.thinkingElapsed || 0) // really still pending (or unreachable), show the wait
+      if (!state) rebase = r // no state yet, sync the bar once one lands
+    }
+    await new Promise(r => setTimeout(r, 1500))
+  }
+}
+
+// the choices llm failed after the clip was delivered: show the error and offer a retry
+function renderRetry(msg) {
+  const box = $('choices')
+  box.innerHTML = ''
+  box.classList.remove('pending')
+  setStatus(msg, true)
+  const btn = document.createElement('button')
+  btn.className = 'continue'
+  btn.textContent = 'Retry'
+  btn.onclick = () => retryChoices()
+  box.appendChild(btn)
+  turnUiTail()
+}
+
+// re-run the failed llm half of the turn, the server reuses the already-rendered clip
+async function retryChoices() {
+  if (opBusy) return
+  opBusy = true
+  const gen = uiGen
+  try {
+    setStatus('')
+    renderThinking(false) // spinner without a poller, the request itself reports the outcome
+    const data = await api('/api/retry', { token: currentToken })
+    if (gen !== uiGen) return
+    setToken(data.token)
+    loadCost()
+    devToken = null // same token but new prompts, an open dev panel must refetch
+    renderChoices(data.choices)
+  } catch (err) {
+    if (gen !== uiGen) return
+    // the retry may have committed (or still be running) with only the response lost
+    try {
+      const state = await (await fetch('/api/state')).json()
+      if (gen !== uiGen) return
+      if (!state.active) return toStartScreen()
+      if (state.token === currentToken && !state.turnError) {
+        renderCost(state.cost)
+        if (state.mode === 'pending') return renderThinking() // still finishing server-side, poll it up
+        devToken = null
+        return renderChoices(state.choices)
+      }
+    } catch {}
+    if (gen !== uiGen) return
+    renderRetry(err.message)
+  } finally {
+    opBusy = false
+  }
 }
 
 // update the sidebar cost tracker from the state's cost payload
@@ -268,7 +396,7 @@ async function loadModels() {
 let devGen = 0 // bumped to invalidate stale dev panel fetches
 let devToken = null // turn token the panel currently shows, avoids duplicate fetches per turn
 
-// fill the dev panel with the llm-generated prompts behind the current turn
+// fill the dev panel with the step times and llm-generated prompts behind the current turn
 async function loadDev(force = false) {
   if (!force && devToken === currentToken) return // panel already shows this turn
   const gen = ++devGen
@@ -279,6 +407,11 @@ async function loadDev(force = false) {
     if (gen !== devGen) return // superseded, don't touch the panel
     if (!d.active) return (el.textContent = 'no active game')
     const parts = []
+    if (d.times) { // step durations of the last finished generation
+      const lines = d.times.steps.map(s => `${s.name}: ${s.secs.toFixed(1)}s`)
+      lines.push(`total: ${d.times.total.toFixed(1)}s`)
+      parts.push(`[last generation times]\n${lines.join('\n')}`)
+    }
     if (d.scenePrompt) parts.push(`[opening frame prompt]\n${d.scenePrompt}`)
     if (d.clipPrompt) parts.push(`[current clip prompt (${d.clipDuration}s)]\n${d.clipPrompt}`)
     if (d.loopPrompt) parts.push(`[idle loop prompt]\n${d.loopPrompt}`)
@@ -635,7 +768,8 @@ async function deleteStory(id) {
 async function resync(mustAdvancePast = null) {
   const gen = uiGen
   let state = await (await fetch('/api/state')).json()
-  while (state.busy) { // a turn is still running server-side, wait for it to settle first
+  // a pending-choices turn is showable as-is: its clip and spinner state are already served
+  while (state.busy && state.mode !== 'pending') { // a turn is still running server-side, wait for it to settle first
     if (gen !== uiGen) return false
     setStatus('A turn is still in progress...')
     await new Promise(r => setTimeout(r, 3000))
@@ -768,9 +902,10 @@ async function advanceTurnInner(label, request, restore, picked) {
   if (gen !== uiGen) return
   // the server has advanced, from here on only the new state may be shown
   setToken(data.token)
-  loadCost() // the turn's spend is final, don't wait out the clip to show it
+  loadCost() // show the spend so far, the choices poll keeps it fresh
   done() // hold the final generation time
-  await playClip(data.clipUrl, data.frameUrl, data.choices, data.mode, data.pendingIdea || '') // waits out the current loop cycle itself
+  // a pending turn's choices are still generating, the spinner takes over when the clip ends
+  await playClip(data.clipUrl, data.frameUrl, data.choices || [], data.pending ? 'pending' : data.mode, data.pendingIdea || '') // waits out the current loop cycle itself
 }
 
 // pick a choice, render the clip, play it, then show the next choices

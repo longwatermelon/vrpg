@@ -16,7 +16,7 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, chooseCustom, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory, isBusy } = await import('./game.js') // import after env is loaded
+const { startGame, chooseOption, chooseCustom, retryTurn, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory, isBusy } = await import('./game.js') // import after env is loaded
 const { getSettings, setSettings, normalizeSettings, listModels, getSelectableModel, EFFORTS, isValidModel } = await import('./llm.js')
 
 // serialize settings validation and writes so concurrent tabs can't combine stale fields
@@ -167,6 +167,10 @@ const server = http.createServer(async (req, res) => {
       if (text.length > 300) return sendJson(res, 400, { error: 'idea too long, keep it under 300 characters' })
       await readySettings()
       return sendJson(res, 200, await chooseCustom(text.trim(), token))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/retry') {
+      const { token } = await readJson(req)
+      return sendJson(res, 200, await retryTurn(token)) // reuses the turn's llm settings snapshot, no readySettings needed
     }
     if (req.method === 'GET' && url.pathname === '/api/timeline') {
       return sendJson(res, 200, getTimeline())
