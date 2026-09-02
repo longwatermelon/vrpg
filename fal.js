@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-const VIDEO_ENDPOINT = 'https://queue.fal.run/minimax/h3-max/image-to-video'
+const VIDEO_ENDPOINT = 'https://queue.fal.run/minimax/h3-max-turbo/image-to-video'
 const IMAGE_ENDPOINT = 'https://queue.fal.run/fal-ai/bytedance/seedream/v4.5/text-to-image'
 const POLL_MS = 750
 const TIMEOUT_MS = 10 * 60 * 1000
@@ -9,8 +9,8 @@ const TIMEOUT_MS = 10 * 60 * 1000
 // fal returns no price field, so spend is estimated from published rates
 const IMAGE_COST = 0.04 // seedream 4.5 flat rate per image
 
-// h3 max 480p rate per second, launch promo ends sept 1
-function videoRate() { return Date.now() < Date.parse('2026-09-01') ? 0.025 : 0.05 }
+// h3 max turbo 480p rate per second, launch promo runs through sept 7
+function videoRate() { return Date.now() < Date.parse('2026-09-08') ? 0.00625 : 0.025 }
 
 // count a completed job's cost once into the story's tracker, a retried await must not charge twice
 function charge(job, amount, cost) {

@@ -64,7 +64,7 @@ Every committed turn writes `session.json` into the story's `data/<id>/` dir: th
 
 LLM: accessed via OpenRouter, or through the official Codex App Server using the player's ChatGPT subscription. Codex authentication and model calls stay local to the running server; structured output and image input use the App Server protocol.
 
-Video model: Minimax H3 Max (via Fal AI).
+Video model: Minimax H3 Max Turbo (via Fal AI).
   * 480p with `balanced` prompt expansion mode
 
 Starting frame image model: Bytedance Seedream 4.5 (via Fal AI).
