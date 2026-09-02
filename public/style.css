@@ -524,7 +524,7 @@ textarea:focus-visible {
 .codex-auth button:hover:not(:disabled) { border-color: rgba(217, 164, 65, 0.7); }
 .codex-auth button:disabled { opacity: 0.5; cursor: default; }
 
-/* cost tracker, small grid at the sidebar bottom */
+/* cost and context tracker, small grid at the sidebar bottom */
 #cost {
   display: grid;
   grid-template-columns: auto auto;
@@ -543,6 +543,25 @@ textarea:focus-visible {
 }
 
 #cost .amt#cost-total { color: var(--ember); }
+
+#cost .context-label { margin-top: 5px; }
+
+#context-bar {
+  grid-column: 1 / -1;
+  height: 3px;
+  margin-top: 2px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(236, 232, 223, 0.15);
+}
+
+#context-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ember);
+  transition: width 0.25s ease;
+}
 
 /* ghost pills: timeline toggle in the corner, restart in the sidebar */
 #timeline-toggle, #restart {

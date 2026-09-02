@@ -33,6 +33,7 @@ const pending = new Map()
 const turnWaiters = new Map()
 const finishedTurns = new Map()
 const turnMessages = new Map()
+const turnUsage = new Map()
 const abandonedTurns = new Set()
 const loginResults = new Map()
 
@@ -51,6 +52,7 @@ function failProcess(err, proc) {
   turnWaiters.clear()
   finishedTurns.clear()
   turnMessages.clear()
+  turnUsage.clear()
   abandonedTurns.clear()
 }
 
@@ -99,9 +101,13 @@ function handleNotification(message) {
     if (params.item.phase === 'final_answer') messages.final = params.item.text
     turnMessages.set(k, messages)
   }
+  if (method === 'thread/tokenUsage/updated' && params?.turnId) {
+    const k = key(params.threadId, params.turnId)
+    if (!abandonedTurns.has(k)) turnUsage.set(k, params.tokenUsage)
+  }
   if (method === 'turn/completed' && params?.turn?.id) {
     const k = key(params.threadId, params.turn.id)
-    if (abandonedTurns.delete(k)) return
+    if (abandonedTurns.delete(k)) { turnUsage.delete(k); return }
     const waiter = turnWaiters.get(k)
     if (waiter) {
       turnWaiters.delete(k)
@@ -274,6 +280,7 @@ export async function listCodexModels() {
         label: model.displayName || model.model || model.id,
         efforts: ['default', ...(model.supportedReasoningEfforts || []).map(option => option.reasoningEffort).filter(Boolean)],
         reasoning: (model.supportedReasoningEfforts || []).length > 0,
+        contextLength: null, // App Server reports the exact window with each turn's usage
         default: !!model.isDefault,
       }))
     })()
@@ -321,7 +328,16 @@ export async function completeWithCodex(messages, schema, config) {
     const messagesForTurn = turnMessages.get(key(threadId, turnId))
     const text = messagesForTurn?.final || messagesForTurn?.last
     if (!text) throw new Error('Codex returned no final response')
-    return text
+    const tokenUsage = turnUsage.get(key(threadId, turnId))
+    return {
+      text,
+      context: tokenUsage ? {
+        inputTokens: tokenUsage.last?.inputTokens,
+        outputTokens: tokenUsage.last?.outputTokens,
+        totalTokens: tokenUsage.last?.totalTokens,
+        limit: tokenUsage.modelContextWindow,
+      } : null,
+    }
   } catch (err) {
     if (turnId && !turnFinished && child) {
       const k = key(threadId, turnId)
@@ -335,6 +351,7 @@ export async function completeWithCodex(messages, schema, config) {
     if (turnId) {
       const k = key(threadId, turnId)
       turnMessages.delete(k)
+      turnUsage.delete(k)
       finishedTurns.delete(k)
     }
     if (child) {

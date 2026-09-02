@@ -49,7 +49,9 @@ BUT: DO NOT force "agency" in the world if it isn't natural. Too many unexpected
 
 MOST IMPORTANTLY: make sure that the events depicted throughout the entire story are REALISTIC and GROUNDED IN REALITY. Do NOT let the story randomly drift towards novelty sludge - that is, don't just say something like "and then there was an evil vampire secretly watching him from behind...", it's cheap. Keep the story focused and grounded, flesh out specific arcs rather than picking a bit of something for every possible topic, make creative grounded choices rather than random "crazy" choices.
 
-Do not shy away from "extremes" - for example, in action scenes, don't shy away from violence. Violence should not be graphic or gore, but it should be impactful; blunt impacts, punches, shoves, etc. but skip giant splashes of blood and the like during the actual depiction. Choices like "Kill <x>" should always be interpreted as blunt force.
+Do not shy away from "extremes" - for example, in action scenes, don't shy away from violence. Violence should not be graphic or gore, but it should be impactful; blunt impacts, punches, shoves, etc. but skip giant splashes of blood and the like during the actual depiction. Choices like "Kill <x>" should always be interpreted as blunt force, and under the constraint of blunt force, make the violence GOOD - not just quick one-shot knockouts unless the hit is seriously hard.
+
+Do NOT show textual information in video; the video model can't render fine text, only big signs (and it can't render those that well either). Make sure all textual information is conveyed with audio.
 
 Example response (player character: a tall young man with short brown hair in a gray hoodie; frame: him at dinner with his girlfriend, a sandwich on her plate - labels may use story knowledge, prompts may not):
   * {"choices": [{"label": "Eat your girlfriend's sandwich", "prompt": "The man in the gray hoodie sitting at the table picks up the half-eaten sandwich from the woman's plate and eats it. A crunch sound plays as the sandwich is consumed. She glares at him, annoyed, and says <d>[English] Would you stop eating my food? Ugh...</d>. End state: the sandwich is completely gone from her plate and she sits glaring at the man in the gray hoodie.", "duration": 8, "loop-prompt": "The man in the gray hoodie sits at the restaurant table chewing slowly, avoiding eye contact with the woman across from him, who glares at him with her arms crossed, occasionally blinking. The camera stays still and both end back exactly at their starting poses."}, {"label": "Call the waiter over", "prompt": "The man in the gray hoodie sitting at the table raises his hand and beckons at a waiter who is currently off-screen; the camera pans to the waiter, who looks like a middle-aged man in the white apron, ignoring the call of the man in the gray hoodie. The man in the gray hoodie laughs it off and gives up, slightly embarrassed. End state: the man is looking away from the woman up at nothing, trying to casually play it off, while the woman looks unimpressed.", "duration": 8, "loop-prompt": "The man in the gray hoodie sits at the restaurant table looking away from the woman, idly glancing around the room; the woman watches him unimpressed, lightly tapping her fingers on the table. The camera stays still and both end back exactly at their starting poses."}]}`
@@ -89,17 +91,26 @@ function timeStart(steps = []) {
   return steps
 }
 
-// run fn and record its duration as a named step in the running pipeline's draft
-async function timed(name, fn) {
+// run fn and record its duration and billed cost as a named pipeline step;
+// the scoped tracker keeps overlapping work from being charged to the wrong step
+async function timed(name, cost, fn) {
   const t = Date.now()
-  const out = await fn()
-  timesDraft?.push({ name, secs: (Date.now() - t) / 1000 })
-  return out
+  let billed = 0
+  const stepCost = { bill(kind, amount) { billed += amount; cost.bill(kind, amount) } }
+  try {
+    return await fn(stepCost)
+  } finally {
+    timesDraft?.push({ name, secs: (Date.now() - t) / 1000, cost: billed })
+  }
 }
 
-// publish the draft as the last pipeline's times, total is the sum of its steps
+// publish the draft as the last pipeline's usage, totals are the sum of its steps
 function timeEnd() {
-  if (timesDraft) turnTimes = { total: timesDraft.reduce((a, s) => a + s.secs, 0), steps: timesDraft }
+  if (timesDraft) turnTimes = {
+    total: timesDraft.reduce((a, s) => a + s.secs, 0),
+    cost: timesDraft.reduce((a, s) => a + s.cost, 0),
+    steps: timesDraft,
+  }
   timesDraft = null
 }
 
@@ -186,8 +197,8 @@ async function nextTurn(s, text, frame, llmSettings) {
       { type: 'image_url', image_url: { url: toDataUri(frame) } },
     ],
   }
-  const { raw, choices } = await chatChoices([...s.messages.map(stripImage), userMsg], s.cost, llmSettings) // only the new frame goes out
-  return { msgs: [userMsg, { role: 'assistant', content: raw }], choices }
+  const { raw, choices, context } = await chatChoices([...s.messages.map(stripImage), userMsg], s.cost, llmSettings) // only the new frame goes out
+  return { msgs: [userMsg, { role: 'assistant', content: raw }], choices, context }
 }
 
 // drop the image from an older user message, the text alone carries the history
@@ -205,6 +216,7 @@ function saveSession(s) {
     scenePrompt: s.scenePrompt,
     messages: s.messages.map(stripImage), // images live on disk as frames
     choices: s.choices,
+    contextHistory: s.contextHistory || [],
     loopPrompt: s.loopPrompt,
     turn: s.turn,
     frame: path.basename(s.frame),
@@ -219,9 +231,11 @@ function saveSession(s) {
 
 // apply a finished turn to session object s; callers persist to disk, then publish
 // callers set s.loopPrompt themselves (baked into the picked choice, or the start call's)
-function applyTurn(s, { msgs, choices }, frame, turn) {
+function applyTurn(s, { msgs, choices, context }, frame, turn) {
   s.messages = [...s.messages.map(stripImage), ...msgs] // keep stored history slim, images live on disk
   s.choices = choices
+  s.contextHistory = [...(s.contextHistory || []).slice(0, turn + 1)]
+  s.contextHistory[turn] = context // preserve empty slots when an older save has no prior usage
   s.frame = frame
   s.turn = turn
   s.pos = turn // a fresh turn always lands at the tip of the timeline
@@ -316,6 +330,13 @@ function getCost() {
   return { llm, fal, total: llm + fal }
 }
 
+// exact token usage reported by the provider for the current story transcript
+function getContextUsage() {
+  const usage = session?.contextHistory?.[session.turn]
+  if (!usage || !Number.isFinite(usage.used)) return null
+  return { used: usage.used, limit: Number.isFinite(usage.limit) ? usage.limit : null }
+}
+
 // cancel in-flight idle loop renders, the loops setting was just turned off
 // already-rendered loops are kept, only masked, so a re-enable can show them again
 // the canceled entry is kept too: it settles on its own (url if the cancel lost the race,
@@ -367,7 +388,7 @@ export function getState() {
   const prog = busy && progress
     ? { weights: progress.weights, step: progress.step, elapsed: (Date.now() - progress.t) / 1000 }
     : null
-  if (!session) return { active: false, busy: settling, cost: getCost(), progress: prog }
+  if (!session) return { active: false, busy: settling, cost: getCost(), context: null, progress: prog }
   // a turn whose clip is out but whose choices are still being written (or failed) overlays the tip
   const pending = pendingRender?.turnToken === token ? pendingRender : null
   return {
@@ -387,6 +408,7 @@ export function getState() {
     loopUrl: getSettings().loops && idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
     loopFailed: !getSettings().loops || (idleLoop?.token === token ? !!idleLoop.failed : true), // no loop coming, stop waiting
     cost: getCost(),
+    context: getContextUsage(),
     progress: prog,
   }
 }
@@ -419,6 +441,7 @@ export function getDebug() {
   return {
     active: true,
     token,
+    pending: pendingRender?.turnToken === token,
     scenePrompt: session.scenePrompt,
     clipPrompt: atTip ? session.clipPrompt || null : null, // a historical clip's prompt isn't tracked
     clipDuration: atTip ? session.clipDuration || null : null,
@@ -441,14 +464,14 @@ export function startGame(context, player) {
     progressStart(loops ? [8, 20, 10, 3, 15] : [8, 20, 10]) // scene write, image gen, first turn llm, then loop llm + idle loop render when loops are on
     timeStart(pendingStart.times) // a retry keeps the reused steps' times
     // flesh out the character and write the opening frame prompt before paying for the image
-    if (!pendingStart.scene) Object.assign(pendingStart, await timed('scene llm', () => startScene(context, player, pendingStart.cost, pendingStart.llmSettings)))
+    if (!pendingStart.scene) Object.assign(pendingStart, await timed('scene llm', pendingStart.cost, cost => startScene(context, player, cost, pendingStart.llmSettings)))
     progressStep() // scene written
     const { dir, character, scene } = pendingStart
     if (!pendingStart.frame) {
-      await timed('frame image', async () => {
+      await timed('frame image', pendingStart.cost, async cost => {
         if (!pendingStart.job) pendingStart.job = await submitImageJob(scene)
         try {
-          pendingStart.frame = await awaitImageJob(pendingStart.job, path.join(dir, 'frame-0'), pendingStart.cost)
+          pendingStart.frame = await awaitImageJob(pendingStart.job, path.join(dir, 'frame-0'), cost)
         } catch (err) {
           if (err.terminal) pendingStart.job = null // job itself failed, a retry resubmits it but keeps the paid steps
           throw err
@@ -458,12 +481,12 @@ export function startGame(context, player) {
     progressStep() // opening frame ready
     const frame = pendingStart.frame
     const candidate = { dir, turn: 0, frame, context, player, character, scenePrompt: scene, cost: pendingStart.cost, messages: [{ role: 'system', content: systemPrompt(character) }], choices: [] }
-    const turn = await timed('choices llm', () => nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame, pendingStart.llmSettings))
+    const turn = await timed('choices llm', pendingStart.cost, cost => nextTurn({ ...candidate, cost }, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame, pendingStart.llmSettings))
     progressStep() // choices llm done
     applyTurn(candidate, turn, frame, 0)
     // separate quick reasoning-off call writes the opening idle loop prompt, best-effort; skipped when loops are off
-    candidate.loopPrompt = loops ? await timed('loop llm', () =>
-      writeLoopPrompt(candidate.messages.map(stripImage), toDataUri(frame), pendingStart.cost, pendingStart.llmSettings)).catch(() => null) : null
+    candidate.loopPrompt = loops ? await timed('loop llm', pendingStart.cost, cost =>
+      writeLoopPrompt(candidate.messages.map(stripImage), toDataUri(frame), cost, pendingStart.llmSettings)).catch(() => null) : null
     progressStep() // loop prompt written, only the idle loop render remains
     saveSession(candidate) // persist first so a failed save fails the start cleanly, memory untouched
     session = candidate // replace any previous game only once the opening turn succeeded
@@ -472,7 +495,7 @@ export function startGame(context, player) {
     // hold the start until the opening frame's idle loop is rendered, so the first
     // thing the player sees is the scene in motion, never the static frame
     // (this also drops a replaced game's still-rendering loop)
-    if (session.loopPrompt) await timed('loop render', () => awaitIdleLoop(session, token))
+    if (session.loopPrompt) await timed('loop render', session.cost, cost => awaitIdleLoop({ ...session, cost }, token))
     else failIdleLoop(token) // no loop prompt, the static frame stands
     pendingStart = null
     timeEnd()
@@ -524,10 +547,10 @@ async function commitChoice(choice, custom, respond) {
   const clip = path.join(session.dir, `clip-${session.turn}.mp4`)
   const frame = path.join(session.dir, `frame-${session.turn + 1}.jpg`)
   if (!pendingRender.done) {
-    await timed('clip render', async () => {
+    await timed('clip render', session.cost, async cost => {
       if (!pendingRender.job) pendingRender.job = await submitJob(choice.prompt, toDataUri(session.frame), choice.duration)
       try {
-        await awaitJob(pendingRender.job, clip, session.cost)
+        await awaitJob(pendingRender.job, clip, cost)
       } catch (err) {
         if (err.terminal) pendingRender.job = null // job itself failed, a retry resubmits it but keeps the choice
         throw err
@@ -567,7 +590,7 @@ async function finishTurn(choice, custom) {
       const text = custom
         ? `Choose custom action: ${choice.label}\nThe action was rendered from this clip prompt: ${choice.prompt}\nIts idle loop prompt: ${choice['loop-prompt']}\nAttached image is the last frame of where this chosen action left off.`
         : `Choose option: ${choice.label}\nAttached image is the last frame of where this chosen action left off.`
-      pendingRender.next = await timed('choices llm', () => nextTurn(s, text, frame, pendingRender.llmSettings))
+      pendingRender.next = await timed('choices llm', s.cost, cost => nextTurn({ ...s, cost }, text, frame, pendingRender.llmSettings))
     }
     const next = pendingRender.next
     // stage the committed state on a copy and persist it before publishing in memory,
@@ -625,20 +648,21 @@ export function chooseCustom(text, clientToken) {
   return runTurn(async respond => {
     checkAtTip(clientToken)
     const key = `custom:${text}`
-    // reuse the generated choice and submitted job on retry instead of paying again;
-    // a job-less entry is a terminal render failure, any other choice may replace it
+    // reuse failed-call usage, a generated choice, and a submitted job on retry;
+    // without an active job, a different choice may replace the pending entry
     if (pendingRender?.token === token && pendingRender.key !== key && pendingRender.job) {
       throw new Error(`a render for "${pendingRender.choice.label}" is already pending, retry that choice`)
     }
     if (pendingRender?.token !== token || pendingRender.key !== key) {
+      pendingRender = { token, key, choice: null, done: false, llmSettings: getLlmSettings(), times: [] }
+    }
+    if (!pendingRender.choice) {
       progressStart([8, 13]) // action write, clip render (weight refined below)
-      const times = timeStart()
-      const llmSettings = getLlmSettings() // one snapshot writes the custom action and the following choices, including retries
+      timeStart(pendingRender.times)
       // the llm takes inspiration from the idea and writes a proper self-contained choice,
       // cached before the render submit so a submit failure never repeats the paid llm call
-      const choice = await timed('action llm', () => customChoice(session.messages.map(stripImage), text, toDataUri(session.frame), session.cost, llmSettings))
-      pendingRender = { token, key, choice, done: false, llmSettings, times }
-      progress.weights[1] = 1.1 * choice.duration // the real clip length is now known
+      pendingRender.choice = await timed('action llm', session.cost, cost => customChoice(session.messages.map(stripImage), text, toDataUri(session.frame), cost, pendingRender.llmSettings))
+      progress.weights[1] = 1.1 * pendingRender.choice.duration // the real clip length is now known
       progressStep() // action written
     } else {
       progressStart([1.1 * pendingRender.choice.duration]) // retry skips the write
@@ -730,6 +754,7 @@ export function truncateStory(turnNo, clientToken) {
     const committed = { ...session }
     committed.messages = session.messages.slice(0, 3 + 2 * turnNo) // keep through this turn's assistant response
     committed.choices = parsed.choices
+    committed.contextHistory = (session.contextHistory || []).slice(0, turnNo + 1)
     committed.loopPrompt = frameLoopPrompt(committed, turnNo) // the prompt behind this turn's frame, cosmetic
     committed.turn = turnNo
     committed.pos = turnNo
@@ -826,6 +851,7 @@ export function loadStory(id) {
       scenePrompt: d.scenePrompt,
       messages: d.messages,
       choices: d.choices,
+      contextHistory: Array.isArray(d.contextHistory) ? d.contextHistory : [],
       loopPrompt: d.loopPrompt || null,
       cost: makeCost(dir), // resumes the story's persisted spend
       loaded: true, // marks the saved clip as historical so resync won't replay it

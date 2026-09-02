@@ -5,6 +5,7 @@ import { completeWithCodex, listCodexModels } from './codex.js'
 
 const API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 const SETTINGS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'settings.json')
+const PROMPT_CACHE = { type: 'ephemeral', ttl: '1h' }
 
 export const EFFORTS = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] // default omits the reasoning param
 export const PROVIDERS = ['openrouter', 'codex']
@@ -108,7 +109,14 @@ function modelEfforts(m) {
 }
 
 function modelInfo(m) {
-  return { id: m.id, label: m.id, efforts: modelEfforts(m), reasoning: !!m.reasoning && !!m.supported_parameters?.includes('reasoning'), default: m.id === DEFAULT_SETTINGS.model }
+  return {
+    id: m.id,
+    label: m.id,
+    efforts: modelEfforts(m),
+    reasoning: !!m.reasoning && !!m.supported_parameters?.includes('reasoning'),
+    contextLength: Number.isFinite(m.context_length) ? m.context_length : null,
+    default: m.id === DEFAULT_SETTINGS.model,
+  }
 }
 
 // list models for the client's picker with the effort values each one exposes
@@ -192,8 +200,17 @@ const RESPONSE_FORMAT = {
 
 // call openrouter chat completions and return the assistant text, format is an optional response_format
 // cost is the story's cost tracker, billed usd goes through cost.bill
+function cacheThroughLastResponse(messages) {
+  const index = messages.findLastIndex(message => message.role === 'assistant')
+  if (index < 0) return messages
+  return messages.map((message, i) => i === index
+    ? { ...message, content: [{ type: 'text', text: message.content, cache_control: PROMPT_CACHE }] }
+    : message)
+}
+
 async function completeOpenRouter(messages, format, cost, config) {
   const { model, effort } = config
+  const metadata = fetchModels().catch(() => [])
   const reasoning = effort !== 'default' && (typeof config.reasoning === 'boolean' ? config.reasoning : await supportsReasoning('openrouter', model))
   if (effort !== 'default' && !reasoning) throw new Error('reasoning effort is not supported by the selected model')
   const res = await fetch(API_URL, {
@@ -204,7 +221,7 @@ async function completeOpenRouter(messages, format, cost, config) {
     },
     body: JSON.stringify({
       model,
-      messages,
+      messages: cacheThroughLastResponse(messages),
       usage: { include: true }, // harmless opt-in in case usage reporting isn't automatic
       ...(reasoning && { reasoning: { effort } }),
       ...(format && {
@@ -219,7 +236,16 @@ async function completeOpenRouter(messages, format, cost, config) {
   cost.bill('llm', data.usage?.cost || 0) // billed even when the content turns out unusable
   const text = data.choices?.[0]?.message?.content
   if (!text) throw new Error(`openrouter returned no content: ${JSON.stringify(data).slice(0, 500)}`)
-  return text
+  const modelData = (await metadata).find(item => item.id === model)
+  return {
+    text,
+    context: {
+      inputTokens: data.usage?.prompt_tokens,
+      outputTokens: data.usage?.completion_tokens,
+      totalTokens: data.usage?.total_tokens,
+      limit: Number.isFinite(modelData?.context_length) ? modelData.context_length : null,
+    },
+  }
 }
 
 // route one normalized request through the selected provider
@@ -256,24 +282,40 @@ export function parseChoices(raw, live = false) {
 
 // call the llm expecting json, retrying once on invalid output, parse returns null when invalid
 async function completeJson(messages, format, parse, what, cost, config = settings) {
-  let raw = await complete(messages, format, cost, config)
+  const first = await complete(messages, format, cost, config)
+  let completion = first
+  let raw = completion.text
   let out = parse(raw)
   if (!out) { // one retry asking the llm to fix its format
-    raw = await complete([
+    completion = await complete([
       ...messages,
       { role: 'assistant', content: raw },
       { role: 'user', content: 'That response was not valid. Respond with only the JSON object in the required format.' },
     ], format, cost, config)
+    raw = completion.text
     out = parse(raw)
     if (!out) throw new Error(`llm returned invalid ${what} json`)
   }
-  return { raw, out }
+  // Report the exact final request. On a format repair this includes the invalid
+  // response and correction prompt that were in the provider's context window.
+  const used = Number.isFinite(completion.context?.totalTokens)
+    ? completion.context.totalTokens
+    : Number.isFinite(completion.context?.inputTokens) && Number.isFinite(completion.context?.outputTokens)
+      ? completion.context.inputTokens + completion.context.outputTokens
+      : null
+  return {
+    raw,
+    out,
+    context: Number.isFinite(used)
+      ? { used, limit: completion.context?.limit || null }
+      : null,
+  }
 }
 
 // get the next set of choices from the llm, retrying once on bad json
 export async function chatChoices(messages, cost, config = settings) {
-  const { raw, out } = await completeJson(messages, RESPONSE_FORMAT, r => parseChoices(r, true), 'choices', cost, config)
-  return { raw, choices: out.choices }
+  const { raw, out, context } = await completeJson(messages, RESPONSE_FORMAT, r => parseChoices(r, true), 'choices', cost, config)
+  return { raw, choices: out.choices, context }
 }
 
 // strict schema for the idle loop prompt call

@@ -79,7 +79,7 @@ function showFrame(url) {
   video.hidden = true
 }
 
-// shared per-turn ui refresh: dev panel, cost tracker, idle loop, timeline
+// shared per-turn ui refresh: dev panel, usage tracker, idle loop, timeline
 function turnUiTail() {
   if ($('dev').open) loadDev() // keep an open dev panel in sync with the new turn
   loadCost() // the turn may have spent money, refresh the tracker
@@ -197,7 +197,7 @@ async function pollChoices() {
     if (state) {
       if (!state.active) return toStartScreen() // reset from another tab
       if (state.token !== myToken) return resync().catch(() => {}) // the game advanced elsewhere, sync to it
-      renderCost(state.cost)
+      renderTracker(state)
       if (state.turnError) return renderRetry(state.turnError)
       if (state.mode !== 'pending') {
         devToken = null // same token but new prompts, an open dev panel must refetch
@@ -250,7 +250,7 @@ async function retryChoices() {
       if (gen !== uiGen) return
       if (!state.active) return toStartScreen()
       if (state.token === currentToken && !state.turnError) {
-        renderCost(state.cost)
+        renderTracker(state)
         if (state.mode === 'pending') return renderThinking() // still finishing server-side, poll it up
         devToken = null
         return renderChoices(state.choices)
@@ -273,9 +273,32 @@ function renderCost(cost) {
   $('cost').hidden = false
 }
 
+// update the context row from the provider's last reported story completion
+function renderContext(context) {
+  const label = $('context-usage')
+  const bar = $('context-bar')
+  const fill = $('context-fill')
+  const compact = n => n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : String(n)
+  if (!context) {
+    label.textContent = '—'
+    fill.style.width = '0%'
+    bar.setAttribute('aria-valuenow', '0')
+    return
+  }
+  label.textContent = context.limit ? `${compact(context.used)} / ${compact(context.limit)}` : compact(context.used)
+  const percent = context.limit ? Math.min(context.used / context.limit * 100, 100) : 0
+  fill.style.width = `${percent}%`
+  bar.setAttribute('aria-valuenow', String(Math.round(percent)))
+}
+
+function renderTracker(state) {
+  renderCost(state.cost)
+  renderContext(state.context)
+}
+
 // fetch the running api spend and refresh the tracker
 async function loadCost() {
-  try { renderCost((await (await fetch('/api/state')).json()).cost) } catch {}
+  try { renderTracker(await (await fetch('/api/state')).json()) } catch {}
 }
 
 const providerModels = new Map() // provider -> model metadata from /api/models
@@ -586,17 +609,18 @@ async function loadDev(force = false) {
     if (gen !== devGen) return // superseded, don't touch the panel
     if (!d.active) return (el.textContent = 'no active game')
     const parts = []
-    if (d.times) { // step durations of the last finished generation
-      const lines = d.times.steps.map(s => `${s.name}: ${s.secs.toFixed(1)}s`)
-      lines.push(`total: ${d.times.total.toFixed(1)}s`)
-      parts.push(`[last generation times]\n${lines.join('\n')}`)
+    if (d.times) { // step durations and costs of the last finished generation
+      const price = n => `$${n.toFixed(4)}`
+      const lines = d.times.steps.map(s => `${s.name}: ${s.secs.toFixed(1)}s / ${price(s.cost)}`)
+      lines.push(`total: ${d.times.total.toFixed(1)}s / ${price(d.times.cost)}`)
+      parts.push(`[last generation usage]\n${lines.join('\n')}`)
     }
     if (d.scenePrompt) parts.push(`[opening frame prompt]\n${d.scenePrompt}`)
     if (d.clipPrompt) parts.push(`[current clip prompt (${d.clipDuration}s)]\n${d.clipPrompt}`)
     if (d.loopPrompt) parts.push(`[idle loop prompt]\n${d.loopPrompt}`)
     d.choices.forEach((c, i) => parts.push(`[option ${i + 1}: ${c.label} (${c.duration}s)]\n${c.prompt}`))
     el.textContent = parts.join('\n\n')
-    devToken = d.token // cache under the server's token, another tab may have advanced the game
+    devToken = d.pending ? null : d.token // pending usage is from the prior turn; refetch when this one finishes
   } catch (err) {
     if (gen === devGen) el.textContent = `failed to load prompts: ${err.message}`
   }
@@ -743,7 +767,7 @@ function startIdleLoop() {
   const tick = async () => {
     try {
       const state = await (await fetch('/api/state')).json()
-      renderCost(state.cost) // free refresh while polling
+      renderTracker(state) // free refresh while polling
       if (self.stopped || gen !== uiGen) return
       if (state.token !== self.token) return // the game advanced elsewhere, this loop is obsolete
       if (state.loopFailed) { self.stop(); return ensureStage() } // no loop this turn (or loops off), the frame stands; a re-enable restarts the poll
@@ -956,7 +980,7 @@ async function resync(mustAdvancePast = null) {
     state = await (await fetch('/api/state')).json()
   }
   if (gen !== uiGen) return false // restarted meanwhile, drop this stale flow
-  renderCost(state.cost)
+  renderTracker(state)
   if (!state.active) return false
   if (mustAdvancePast !== null && state.token === mustAdvancePast) return false
   const advanced = state.token !== currentToken
