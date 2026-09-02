@@ -46,6 +46,8 @@ Use start keyframe = current frozen frame, send the prompt field directly to the
 
 Each choice carries its own `loop-prompt`, written by the story LLM alongside the clip prompt from that choice's intended end state (no extra LLM call sits ahead of the loop render). It describes a 5s idle animation of the frame the clip ends on (the one the choices are offered on): camera roughly still, characters doing subtle believable idle motion, ending back exactly at the start pose so it loops seamlessly. The moment the chosen clip renders and its last frame is extracted, the loop render starts with duration 5 and that frame as both start keyframe and `end_image_url`, forcing the loop closed. Neither the loop nor the choices block the clip: the loop goes on stage whenever its render finishes, and the choices appear whenever their call finishes — the two are independent. The opening turn is the exception: its loop prompt still comes from its own quick LLM call (same transcript plus the opening frame, reasoning forced off — effort `none` when the model allows it, model default otherwise), since no choice describes the opening frame and the start is allowed to be slow — the start call returns once its loop is rendered, and the client stages the loop with the first choices (the static frame is only a failure fallback).
 
+Idle loops can be disabled with a settings toggle (persisted with the LLM settings, changeable between turns): no loop renders are paid for and the opening loop-prompt call is skipped (choice responses still carry their loop-prompt fields), and even already-rendered loops stop displaying — the frozen frame stands between turns. Toggling back on brings loops right back: the tip frame's loop renders fresh (reused from disk when present) and historical disk loops reappear. Two documented exceptions: a game started with loops off has no opening loop prompt, so its loop only comes back from the first action turn on; and re-enabling while browsing history renders nothing for the tip — its loop returns with the next turn.
+
 ## Custom actions
 
 Besides the 2-3 offered choices, the player can type their own idea into a fourth box. An extra LLM call (same transcript plus the current frame) takes *inspiration* from the idea and writes one concrete choice (label, prompt, duration, loop-prompt) following the normal prompt rules; the turn then proceeds exactly like a preset choice, with `Choose custom action: <label>` as the user message.
@@ -60,7 +62,7 @@ Every committed turn writes `session.json` into the story's `data/<id>/` dir: th
 
 ## Models
 
-LLM: accessed via OpenRouter.
+LLM: accessed via OpenRouter, or through the official Codex App Server using the player's ChatGPT subscription. Codex authentication and model calls stay local to the running server; structured output and image input use the App Server protocol.
 
 Video model: Minimax H3 Max (via Fal AI).
   * 480p with `balanced` prompt expansion mode

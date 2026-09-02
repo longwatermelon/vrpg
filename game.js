@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { chatChoices, startScene, customChoice, writeLoopPrompt, parseChoices, getLlmSettings } from './llm.js'
+import { chatChoices, startScene, customChoice, writeLoopPrompt, parseChoices, getLlmSettings, getSettings } from './llm.js'
 import { submitJob, awaitJob, submitImageJob, awaitImageJob, cancelJob } from './fal.js'
 import { extractLastFrame, concatClips, concatClipsWithChoices } from './media.js'
 
@@ -113,9 +113,10 @@ function dropIdleLoop() {
 // render a 5s idle loop of a frame, best-effort, returns a never-rejecting promise
 // s carries dir, turn (names the loop file), frame, loopPrompt, cost; a session object fits directly
 function startIdleLoopRender(s, tok) {
+  if (!getSettings().loops) { failIdleLoop(tok); return Promise.resolve() } // loops disabled, don't pay for the render
   // a real render (even a failed one) for this turn is reused so nothing resubmits;
-  // promise-less entries (hold/fail placeholders) are replaced
-  if (idleLoop?.token === tok && idleLoop.promise) return idleLoop.promise
+  // promise-less entries (hold/fail placeholders) and settled canceled renders are replaced
+  if (idleLoop?.token === tok && idleLoop.promise && !(idleLoop.aborted && idleLoop.failed)) return idleLoop.promise
   dropIdleLoop() // a previous turn's loop still rendering is stale, cancel it
   const out = path.join(s.dir, `loop-${s.turn}.mp4`)
   const state = { token: tok, url: null, out }
@@ -123,7 +124,9 @@ function startIdleLoopRender(s, tok) {
   state.promise = (async () => {
     const frameUri = toDataUri(s.frame)
     state.job = await submitJob(s.loopPrompt, frameUri, 5, frameUri) // same frame as start and end forces a closed loop
-    if (state.aborted) return cancelJob(state.job) // dropped while submitting
+    // aborted while submitting: cancel best-effort but keep awaiting, so the entry settles
+    // truthfully (url if the cancel loses, failed if it wins) and a retry can't double-submit
+    if (state.aborted) cancelJob(state.job)
     await awaitJob(state.job, out, s.cost)
     state.url = toUrl(out)
   })().catch(() => { state.failed = true }) // no loop, the static frame stands; keep the entry so nothing resubmits
@@ -311,6 +314,44 @@ function getCost() {
   return { llm, fal, total: llm + fal }
 }
 
+// cancel in-flight idle loop renders, the loops setting was just turned off
+// already-rendered loops are kept, only masked, so a re-enable can show them again
+// the canceled entry is kept too: it settles on its own (url if the cancel lost the race,
+// failed otherwise), and a quick re-enable reuses it instead of double-submitting its file
+export function stopIdleLoops() {
+  if (loopInFlight(idleLoop)) {
+    idleLoop.aborted = true // a submit still in flight cancels on arrival
+    cancelJob(idleLoop.job)
+  }
+  dropParkedLoop() // a parked tip render would be hidden spend too
+}
+
+// best-effort render the current frame's idle loop, the loops setting was just turned back on
+// only the tip (or an unfinished turn's outcome frame) renders fresh; historical positions
+// reuse disk loops via the getState unmask
+export function resumeIdleLoop() {
+  if (!session) return
+  // a turn whose clip is out but whose choices failed shows its outcome frame, not the session's
+  const pending = pendingRender?.turnToken === token ? pendingRender : null
+  if (!pending && (session.pos !== session.turn || !session.loopPrompt)) return
+  const cur = idleLoop
+  if (cur?.token === token && !cur.failed) {
+    // a canceled render still settling is reused; if the cancel wins, retry so the loop still arrives
+    if (cur.aborted && cur.promise) cur.promise.then(() => {
+      if (idleLoop === cur && cur.failed && getSettings().loops) resumeIdleLoop()
+    })
+    return
+  }
+  const turnNo = pending ? session.turn + 1 : session.turn
+  const f = path.join(session.dir, `loop-${turnNo}.mp4`)
+  if (fs.existsSync(f)) { idleLoop = { token, url: toUrl(f) }; return } // already on disk
+  if (pending) {
+    if (pending.choice['loop-prompt']) startIdleLoopRender({ dir: session.dir, turn: turnNo, frame: pending.frame, loopPrompt: pending.choice['loop-prompt'], cost: session.cost }, token)
+    return // a choice without a loop prompt (old save) stays on the static frame
+  }
+  startIdleLoopRender(session, token)
+}
+
 // whether a game operation is running, settings changes are rejected meanwhile
 // so one turn can't mix two models or efforts across its llm calls
 export function isBusy() {
@@ -340,8 +381,9 @@ export function getState() {
       (session.pos === session.turn && session.clip ? toUrl(session.clip) : null),
     // historical clip of a resumed story, not a missed turn; a pending clip replays only on a lost response
     loadedClip: pending || navClip?.token === token ? false : !!(session.clip && session.loaded),
-    loopUrl: idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
-    loopFailed: idleLoop?.token === token ? !!idleLoop.failed : true, // no loop entry means none is coming, stop waiting
+    // loops disabled masks even an already-rendered loop, the static frame stands
+    loopUrl: getSettings().loops && idleLoop?.token === token ? idleLoop.url : null, // current frame's idle loop, if ready
+    loopFailed: !getSettings().loops || (idleLoop?.token === token ? !!idleLoop.failed : true), // no loop coming, stop waiting
     cost: getCost(),
     progress: prog,
   }
@@ -393,7 +435,8 @@ export function startGame(context, player) {
       fs.mkdirSync(dir, { recursive: true })
       pendingStart = { context, player, dir, cost: makeCost(dir), llmSettings: getLlmSettings(), times: [] } // tracker and llm snapshot exist before the first paid call
     }
-    progressStart([8, 20, 10, 3, 15]) // scene write, image gen, first turn llm, loop llm, idle loop render
+    const loops = getSettings().loops // one snapshot per attempt, settings are locked while busy
+    progressStart(loops ? [8, 20, 10, 3, 15] : [8, 20, 10]) // scene write, image gen, first turn llm, then loop llm + idle loop render when loops are on
     timeStart(pendingStart.times) // a retry keeps the reused steps' times
     // flesh out the character and write the opening frame prompt before paying for the image
     if (!pendingStart.scene) Object.assign(pendingStart, await timed('scene llm', () => startScene(context, player, pendingStart.cost, pendingStart.llmSettings)))
@@ -416,9 +459,9 @@ export function startGame(context, player) {
     const turn = await timed('choices llm', () => nextTurn(candidate, `Start a new game. The player's starting context: ${context}\nAttached image is the opening frame of the game.`, frame, pendingStart.llmSettings))
     progressStep() // choices llm done
     applyTurn(candidate, turn, frame, 0)
-    // separate quick reasoning-off call writes the opening idle loop prompt, best-effort
-    candidate.loopPrompt = await timed('loop llm', () =>
-      writeLoopPrompt(candidate.messages.map(stripImage), toDataUri(frame), pendingStart.cost, pendingStart.llmSettings)).catch(() => null)
+    // separate quick reasoning-off call writes the opening idle loop prompt, best-effort; skipped when loops are off
+    candidate.loopPrompt = loops ? await timed('loop llm', () =>
+      writeLoopPrompt(candidate.messages.map(stripImage), toDataUri(frame), pendingStart.cost, pendingStart.llmSettings)).catch(() => null) : null
     progressStep() // loop prompt written, only the idle loop render remains
     saveSession(candidate) // persist first so a failed save fails the start cleanly, memory untouched
     session = candidate // replace any previous game only once the opening turn succeeded

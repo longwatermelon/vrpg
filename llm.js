@@ -1,33 +1,44 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { completeWithCodex, listCodexModels } from './codex.js'
 
 const API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 const SETTINGS_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'settings.json')
 
-export const EFFORTS = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] // default omits the reasoning param
+export const EFFORTS = ['default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] // default omits the reasoning param
+export const PROVIDERS = ['openrouter', 'codex']
 
-// valid openrouter model id for the settings, shared by load, update, and the api route
-export function isValidModel(m) {
-  if (typeof m !== 'string') return false
-  const id = m.trim()
-  return id.length <= 200 && /^~?[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:-]*$/.test(id)
+export function isValidProvider(provider) {
+  return PROVIDERS.includes(provider)
 }
 
-const DEFAULT_SETTINGS = { model: 'anthropic/claude-opus-4.6', effort: 'default', reasoning: null }
+// safe provider model id for settings; capability validation happens through discovery
+export function isValidModel(m, provider = 'openrouter') {
+  if (typeof m !== 'string') return false
+  const id = m.trim()
+  if (!id || id.length > 200) return false
+  return provider === 'codex'
+    ? /^[a-z0-9][a-z0-9._:-]*$/i.test(id)
+    : /^~?[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:-]*$/.test(id)
+}
+
+const DEFAULT_SETTINGS = { provider: 'openrouter', model: 'anthropic/claude-opus-4.6', effort: 'default', reasoning: null, loops: true }
 
 // model + reasoning effort used for every llm call, persisted across restarts
 let settings = { ...DEFAULT_SETTINGS }
 try { // resume saved settings, a missing or corrupt file keeps the defaults
   const d = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-  if (isValidModel(d.model)) settings.model = d.model.trim()
+  if (isValidProvider(d.provider)) settings.provider = d.provider
+  if (isValidModel(d.model, settings.provider)) settings.model = d.model.trim()
   if (EFFORTS.includes(d.effort)) settings.effort = d.effort
   if (typeof d.reasoning === 'boolean') settings.reasoning = d.reasoning
+  if (typeof d.loops === 'boolean') settings.loops = d.loops
 } catch {}
 
-// current llm settings for the client
+// current settings for the client
 export function getSettings() {
-  return { model: settings.model, effort: settings.effort }
+  return { provider: settings.provider, model: settings.model, effort: settings.effort, loops: settings.loops }
 }
 
 // internal snapshot also carries whether reasoning support was metadata-validated
@@ -35,17 +46,19 @@ export function getLlmSettings() {
   return { ...settings }
 }
 
-// update and persist the llm settings, missing fields keep their value
+// update and persist the settings, missing fields keep their value
 // persists before publishing, so a failed save errors out with memory and disk still in sync
-export function setSettings({ model, effort, reasoning }) {
+export function setSettings({ provider, model, effort, reasoning, loops }) {
   const next = { ...settings }
-  if (isValidModel(model)) {
+  if (isValidProvider(provider)) next.provider = provider
+  if (isValidModel(model, next.provider)) {
     const id = model.trim()
     if (id !== next.model && reasoning === undefined) next.reasoning = null
     next.model = id
   }
   if (EFFORTS.includes(effort)) next.effort = effort
   if (typeof reasoning === 'boolean' || reasoning === null) next.reasoning = reasoning
+  if (typeof loops === 'boolean') next.loops = loops
   fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
   fs.writeFileSync(SETTINGS_FILE + '.tmp', JSON.stringify(next))
   fs.renameSync(SETTINGS_FILE + '.tmp', SETTINGS_FILE) // atomic so a crash can't leave a torn file
@@ -95,41 +108,42 @@ function modelEfforts(m) {
 }
 
 function modelInfo(m) {
-  return { id: m.id, efforts: modelEfforts(m), reasoning: !!m.reasoning && !!m.supported_parameters?.includes('reasoning') }
+  return { id: m.id, label: m.id, efforts: modelEfforts(m), reasoning: !!m.reasoning && !!m.supported_parameters?.includes('reasoning'), default: m.id === DEFAULT_SETTINGS.model }
 }
 
 // list models for the client's picker with the effort values each one exposes
-export async function listModels() {
+export async function listModels(provider = settings.provider) {
+  if (provider === 'codex') return listCodexModels()
   return (await fetchModels())
     .filter(supportsGame)
     .map(modelInfo)
     .sort((a, b) => a.id.localeCompare(b.id))
 }
 
-// verify a newly selected model against current openrouter capabilities
-export async function getSelectableModel(model) {
+// verify a newly selected model against the selected provider's capabilities
+export async function getSelectableModel(provider, model) {
   const id = model.trim()
+  if (provider === 'codex') return (await listCodexModels()).find(m => m.id === id) || null
   const m = (await fetchModels()).find(m => m.id === id && supportsGame(m))
   return m ? modelInfo(m) : null
 }
 
 // repair persisted settings against current metadata before exposing or using them
 export async function normalizeSettings() {
-  const metadata = await fetchModels().catch(() => null)
-  if (!metadata) { // discovery outage: a previously validated pair can still proceed
+  const models = await listModels(settings.provider).catch(() => null)
+  if (!models) { // discovery outage: a previously validated pair can still proceed
     if (settings.effort !== 'default' && settings.reasoning === false) return setSettings({ effort: 'default' })
     if (settings.effort !== 'default' && settings.reasoning === null) {
-      throw new Error('cannot validate the saved reasoning effort while openrouter model discovery is unavailable')
+      throw new Error('cannot validate the saved reasoning effort while model discovery is unavailable')
     }
     return getSettings()
   }
-  const models = metadata.filter(supportsGame).map(modelInfo)
   if (!models.length) return getSettings()
   const selected = models.find(m => m.id === settings.model) ||
-    models.find(m => m.id === DEFAULT_SETTINGS.model) || models[0]
+    models.find(m => m.default) || models[0]
   const effort = selected.efforts.includes(settings.effort) ? settings.effort : 'default'
   if (selected.id !== settings.model || effort !== settings.effort || selected.reasoning !== settings.reasoning) {
-    return setSettings({ model: selected.id, effort, reasoning: selected.reasoning })
+    return setSettings({ provider: settings.provider, model: selected.id, effort, reasoning: selected.reasoning })
   }
   return getSettings()
 }
@@ -137,11 +151,11 @@ export async function normalizeSettings() {
 // whether a model takes the reasoning param at all, sending it to a model that
 // doesn't would leave no provider under require_parameters; when metadata is
 // unavailable, omit the optional param and let the base request continue
-async function supportsReasoning(model) {
-  const models = await fetchModels().catch(() => null)
+async function supportsReasoning(provider, model) {
+  const models = await listModels(provider).catch(() => null)
   const m = models?.find(x => x.id === model)
-  if (!m) throw new Error('cannot verify reasoning support while openrouter model discovery is unavailable')
-  return !!m.reasoning && !!m.supported_parameters?.includes('reasoning')
+  if (!m) throw new Error('cannot verify reasoning support while model discovery is unavailable')
+  return !!m.reasoning
 }
 
 // strict schema for the choices contract, enforced server-side by openrouter
@@ -178,9 +192,9 @@ const RESPONSE_FORMAT = {
 
 // call openrouter chat completions and return the assistant text, format is an optional response_format
 // cost is the story's cost tracker, billed usd goes through cost.bill
-async function complete(messages, format, cost, config) {
+async function completeOpenRouter(messages, format, cost, config) {
   const { model, effort } = config
-  const reasoning = effort !== 'default' && (typeof config.reasoning === 'boolean' ? config.reasoning : await supportsReasoning(model))
+  const reasoning = effort !== 'default' && (typeof config.reasoning === 'boolean' ? config.reasoning : await supportsReasoning('openrouter', model))
   if (effort !== 'default' && !reasoning) throw new Error('reasoning effort is not supported by the selected model')
   const res = await fetch(API_URL, {
     method: 'POST',
@@ -206,6 +220,14 @@ async function complete(messages, format, cost, config) {
   const text = data.choices?.[0]?.message?.content
   if (!text) throw new Error(`openrouter returned no content: ${JSON.stringify(data).slice(0, 500)}`)
   return text
+}
+
+// route one normalized request through the selected provider
+async function complete(messages, format, cost, config) {
+  if (config.provider === 'codex') {
+    return completeWithCodex(messages, format?.json_schema?.schema || null, config)
+  }
+  return completeOpenRouter(messages, format, cost, config)
 }
 
 // strip markdown fences and parse json from raw llm output, null on failure
@@ -279,9 +301,8 @@ function parseLoop(raw) {
 // allows it, the model default when reasoning is mandatory or unsupported
 async function loopEffort(config) {
   if (!config.reasoning) return 'default' // model takes no reasoning param, nothing to turn off
-  const models = await fetchModels().catch(() => null)
-  const m = models?.find(x => x.id === config.model)
-  return m && modelEfforts(m).includes('none') ? 'none' : 'default'
+  const model = await getSelectableModel(config.provider, config.model).catch(() => null)
+  return model?.efforts.includes('none') ? 'none' : 'default'
 }
 
 // write the idle loop prompt for the opening frame, a quick reasoning-off call on the same transcript

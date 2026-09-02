@@ -16,8 +16,9 @@ function loadEnv() {
 }
 loadEnv()
 
-const { startGame, chooseOption, chooseCustom, retryTurn, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory, isBusy } = await import('./game.js') // import after env is loaded
-const { getSettings, setSettings, normalizeSettings, listModels, getSelectableModel, EFFORTS, isValidModel } = await import('./llm.js')
+const { startGame, chooseOption, chooseCustom, retryTurn, getState, getDebug, resetGame, listStories, loadStory, deleteStory, renderStory, getTimeline, seekTurn, continueStory, truncateStory, isBusy, stopIdleLoops, resumeIdleLoop } = await import('./game.js') // import after env is loaded
+const { getSettings, setSettings, normalizeSettings, listModels, getSelectableModel, EFFORTS, isValidModel, isValidProvider } = await import('./llm.js')
+const { getCodexStatus, startCodexLogin, getCodexLoginStatus, cancelCodexLogin, logoutCodex } = await import('./codex.js')
 
 // serialize settings validation and writes so concurrent tabs can't combine stale fields
 let settingsWork = Promise.resolve()
@@ -33,22 +34,47 @@ function apiError(status, message) {
   return err
 }
 
-async function applySettings(model, effort) {
+async function applySettings(provider, model, effort, loops) {
   if (isBusy()) throw apiError(409, 'a turn is in progress, change settings once it finishes')
   const current = getSettings()
-  const selected = await getSelectableModel(model === undefined ? current.model : model)
-  if (model !== undefined && !selected) throw apiError(400, 'model must support image input and structured text output')
-  let nextEffort = effort === undefined ? current.effort : effort
-  if (!selected?.efforts.includes(nextEffort)) {
-    if (effort !== undefined && effort !== 'default') throw apiError(400, 'reasoning effort is not supported by this model')
-    nextEffort = 'default' // a model change resets an incompatible old effort
+  const nextProvider = provider === undefined ? current.provider : provider
+  if (model !== undefined && !isValidModel(model, nextProvider)) throw apiError(400, 'invalid model')
+  let saved
+  if (provider === undefined && model === undefined && effort === undefined) {
+    saved = setSettings({ loops }) // loops-only change needs no model validation
+  } else {
+    let nextModel = model === undefined && nextProvider === current.provider ? current.model : model
+    if (nextModel === undefined) {
+      const models = await listModels(nextProvider)
+      nextModel = (models.find(m => m.default) || models[0])?.id
+    }
+    const selected = nextModel ? await getSelectableModel(nextProvider, nextModel) : null
+    if (!selected) throw apiError(400, 'model must support image input and structured text output')
+    let nextEffort = effort === undefined ? current.effort : effort
+    if (!selected?.efforts.includes(nextEffort)) {
+      if (effort !== undefined && effort !== 'default') throw apiError(400, 'reasoning effort is not supported by this model')
+      nextEffort = 'default' // a model change resets an incompatible old effort
+    }
+    if (isBusy()) throw apiError(409, 'a turn started while settings were being checked, try again once it finishes')
+    saved = setSettings({ provider: nextProvider, model: nextModel, effort: nextEffort, reasoning: selected.reasoning, loops })
   }
-  if (isBusy()) throw apiError(409, 'a turn started while settings were being checked, try again once it finishes')
-  return setSettings({ model, effort: nextEffort, reasoning: selected?.reasoning })
+  if (loops === false) stopIdleLoops() // an in-flight loop render is hidden spend now, cancel it
+  if (loops === true) resumeIdleLoop() // best-effort render of the tip frame's loop
+  return saved
 }
 
 function readySettings() {
   return withSettingsLock(normalizeSettings)
+}
+
+async function readyForTurn() {
+  const settings = await readySettings()
+  if (settings.provider === 'codex') {
+    const status = await getCodexStatus()
+    if (!status.available) throw apiError(503, status.error || 'Codex App Server is unavailable')
+    if (!status.connected) throw apiError(401, 'connect a ChatGPT account before using the Codex provider')
+  }
+  return settings
 }
 
 const MIME = {
@@ -153,19 +179,19 @@ const server = http.createServer(async (req, res) => {
       if (typeof character !== 'string' || !character.trim()) return sendJson(res, 400, { error: 'character is required' })
       if (context.length > 2000) return sendJson(res, 400, { error: 'context too long, keep it under 2000 characters' })
       if (character.length > 500) return sendJson(res, 400, { error: 'character too long, keep it under 500 characters' })
-      await readySettings()
+      await readyForTurn()
       return sendJson(res, 200, await startGame(context.trim(), character.trim()))
     }
     if (req.method === 'POST' && url.pathname === '/api/choose') {
       const { index, token } = await readJson(req)
-      await readySettings()
+      await readyForTurn()
       return sendJson(res, 200, await chooseOption(index, token))
     }
     if (req.method === 'POST' && url.pathname === '/api/choose-custom') {
       const { text, token } = await readJson(req)
       if (typeof text !== 'string' || !text.trim()) return sendJson(res, 400, { error: 'text is required' })
       if (text.length > 300) return sendJson(res, 400, { error: 'idea too long, keep it under 300 characters' })
-      await readySettings()
+      await readyForTurn()
       return sendJson(res, 200, await chooseCustom(text.trim(), token))
     }
     if (req.method === 'POST' && url.pathname === '/api/retry') {
@@ -211,13 +237,38 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, await readySettings())
     }
     if (req.method === 'POST' && url.pathname === '/api/settings') {
-      const { model, effort } = await readJson(req)
-      if (model !== undefined && !isValidModel(model)) return sendJson(res, 400, { error: 'invalid model' })
+      const { provider, model, effort, loops } = await readJson(req)
+      if (provider !== undefined && !isValidProvider(provider)) return sendJson(res, 400, { error: 'invalid provider' })
       if (effort !== undefined && !EFFORTS.includes(effort)) return sendJson(res, 400, { error: 'invalid effort' })
-      return sendJson(res, 200, await withSettingsLock(() => applySettings(model, effort)))
+      if (loops !== undefined && typeof loops !== 'boolean') return sendJson(res, 400, { error: 'invalid loops flag' })
+      return sendJson(res, 200, await withSettingsLock(() => applySettings(provider, model, effort, loops)))
     }
     if (req.method === 'GET' && url.pathname === '/api/models') {
-      return sendJson(res, 200, { models: await listModels() })
+      const provider = url.searchParams.get('provider') || getSettings().provider
+      if (!isValidProvider(provider)) return sendJson(res, 400, { error: 'invalid provider' })
+      return sendJson(res, 200, { provider, models: await listModels(provider) })
+    }
+    if (req.method === 'GET' && url.pathname === '/api/codex/status') {
+      return sendJson(res, 200, await getCodexStatus())
+    }
+    if (req.method === 'POST' && url.pathname === '/api/codex/login') {
+      await readJson(req)
+      return sendJson(res, 200, await startCodexLogin())
+    }
+    if (req.method === 'POST' && url.pathname === '/api/codex/login/cancel') {
+      const { loginId } = await readJson(req)
+      if (typeof loginId !== 'string' || !loginId) return sendJson(res, 400, { error: 'login id is required' })
+      return sendJson(res, 200, await cancelCodexLogin(loginId))
+    }
+    if (req.method === 'GET' && url.pathname === '/api/codex/login/status') {
+      const loginId = url.searchParams.get('loginId')
+      if (!loginId) return sendJson(res, 400, { error: 'login id is required' })
+      return sendJson(res, 200, getCodexLoginStatus(loginId))
+    }
+    if (req.method === 'POST' && url.pathname === '/api/codex/logout') {
+      await readJson(req)
+      if (isBusy()) throw apiError(409, 'a turn is in progress, disconnect ChatGPT once it finishes')
+      return sendJson(res, 200, await logoutCodex())
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       return sendJson(res, 200, getState())

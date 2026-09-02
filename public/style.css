@@ -455,12 +455,74 @@ textarea:focus-visible {
   min-width: 200px;
 }
 
+.llm-settings .provider-select { min-width: 145px; }
+
 .llm-settings select option { background: #0a0908; } /* native dropdown follows the dark theme */
 
 .llm-settings select:focus {
   outline: none;
   border-color: rgba(217, 164, 65, 0.6);
 }
+
+/* idle loops toggle, sits with the settings selects */
+.llm-settings .loops-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  background: rgba(236, 232, 223, 0.05);
+  color: var(--ink);
+  font-family: var(--utility);
+  font-size: 0.8rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.llm-settings .loops-toggle input {
+  accent-color: #d9a441;
+  cursor: pointer;
+  margin: 0;
+}
+
+.codex-auth {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--ink-dim);
+  font-family: var(--utility);
+  font-size: 0.72rem;
+}
+
+.codex-auth[hidden] { display: none; }
+
+.codex-device-code {
+  padding: 4px 7px;
+  border: 1px solid rgba(217, 164, 65, 0.55);
+  border-radius: 3px;
+  color: var(--ember);
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  user-select: all;
+}
+
+.codex-auth button {
+  padding: 5px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  background: rgba(236, 232, 223, 0.05);
+  color: var(--ink);
+  font-family: var(--utility);
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.codex-auth button:hover:not(:disabled) { border-color: rgba(217, 164, 65, 0.7); }
+.codex-auth button:disabled { opacity: 0.5; cursor: default; }
 
 /* cost tracker, small grid at the sidebar bottom */
 #cost {

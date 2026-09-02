@@ -231,7 +231,7 @@ function renderRetry(msg) {
 // re-run the failed llm half of the turn, the server reuses the already-rendered clip
 async function retryChoices() {
   if (opBusy) return
-  opBusy = true
+  setOperationBusy(true)
   const gen = uiGen
   try {
     setStatus('')
@@ -259,7 +259,7 @@ async function retryChoices() {
     if (gen !== uiGen) return
     renderRetry(err.message)
   } finally {
-    opBusy = false
+    setOperationBusy(false)
   }
 }
 
@@ -278,7 +278,9 @@ async function loadCost() {
   try { renderCost((await (await fetch('/api/state')).json()).cost) } catch {}
 }
 
-let modelInfo = new Map() // model id -> supported reasoning efforts, from /api/models
+const providerModels = new Map() // provider -> model metadata from /api/models
+const modelLoads = new Map()
+const rememberedModels = new Map()
 
 const effortLabels = {
   default: 'model default',
@@ -289,6 +291,11 @@ const effortLabels = {
   high: 'high reasoning',
   xhigh: 'xhigh reasoning',
   max: 'max reasoning',
+  ultra: 'ultra reasoning',
+}
+
+function selectedProvider() {
+  return document.querySelector('.provider-select').value
 }
 
 // set a model select to a value, creating the option when the list doesn't have it
@@ -302,17 +309,39 @@ function setModelValue(el, model) {
   el.value = model
 }
 
-// fill every settings control (start screen and sidebar) with the given llm settings
+// fill every settings control (start screen and sidebar) with the given settings
 function renderSettings(s) {
-  for (const el of document.querySelectorAll('.model-select')) setModelValue(el, s.model)
+  for (const el of document.querySelectorAll('.provider-select')) el.value = s.provider
+  rememberedModels.set(s.provider, s.model)
+  renderModelOptions(s.provider, s.model)
   for (const el of document.querySelectorAll('.effort-select')) el.value = s.effort
+  for (const el of document.querySelectorAll('.loops-check')) el.checked = s.loops !== false // old servers omit the field, loops default on
   updateEffortOptions()
+  showCodexAuth(s.provider === 'codex')
+  loadModels(s.provider).catch(() => {})
+}
+
+function renderModelOptions(provider, selected) {
+  const models = providerModels.get(provider)
+  for (const el of document.querySelectorAll('.model-select')) {
+    if (models) {
+      el.innerHTML = ''
+      for (const model of models) {
+        const opt = document.createElement('option')
+        opt.value = model.id
+        opt.textContent = model.label || model.id
+        el.appendChild(opt)
+      }
+    }
+    setModelValue(el, selected)
+  }
 }
 
 // show only efforts the picked model exposes; unknown models keep the existing options
 function updateEffortOptions() {
+  const provider = selectedProvider()
   const model = document.querySelector('.model-select').value
-  const efforts = modelInfo.get(model)?.efforts
+  const efforts = providerModels.get(provider)?.find(item => item.id === model)?.efforts
   if (!efforts) return
   for (const el of document.querySelectorAll('.effort-select')) {
     const current = el.value
@@ -374,23 +403,173 @@ function saveSettings(patch) {
   return p
 }
 
-// fill both model dropdowns from openrouter's model list, keeping the current selection
-async function loadModels() {
+async function loadModels(provider) {
+  if (providerModels.has(provider)) return providerModels.get(provider)
+  if (!modelLoads.has(provider)) {
+    modelLoads.set(provider, (async () => {
+      const res = await fetch(`/api/models?provider=${encodeURIComponent(provider)}`)
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'failed to load models')
+      providerModels.set(provider, data.models)
+      return data.models
+    })().finally(() => modelLoads.delete(provider)))
+  }
+  const models = await modelLoads.get(provider)
+  if (selectedProvider() === provider) {
+    const current = rememberedModels.get(provider) || document.querySelector('.model-select').value
+    renderModelOptions(provider, current)
+    updateEffortOptions()
+  }
+  return models
+}
+
+function showCodexAuth(show) {
+  for (const el of document.querySelectorAll('.codex-auth')) el.hidden = !show
+  if (show) loadCodexStatus()
+}
+
+let codexStatusPromise = null
+let codexLoginPrompt = null
+
+function renderCodexStatus(status) {
+  const waiting = !status.connected && codexLoginPrompt?.userCode
+  const label = status.connected
+    ? `connected${status.account?.email ? ` as ${status.account.email}` : ''}${status.account?.plan ? ` (${status.account.plan})` : ''}`
+    : waiting ? 'Enter this code on the opened ChatGPT page:'
+      : status.available ? 'ChatGPT not connected' : (status.error || 'Codex unavailable')
+  for (const el of document.querySelectorAll('.codex-auth-status')) el.textContent = label
+  for (const el of document.querySelectorAll('.codex-device-code')) {
+    el.textContent = waiting || ''
+    el.hidden = !waiting
+  }
+  for (const el of document.querySelectorAll('.codex-copy')) el.hidden = !waiting
+  for (const el of document.querySelectorAll('.codex-login')) el.hidden = status.connected || !status.available || !!waiting
+  for (const el of document.querySelectorAll('.codex-logout')) {
+    el.hidden = !status.connected
+    el.disabled = opBusy
+  }
+}
+
+async function copyCodexCode() {
+  const code = codexLoginPrompt?.userCode
+  if (!code) return
   try {
-    const { models } = await (await fetch('/api/models')).json()
-    modelInfo = new Map(models.map(m => [m.id, m]))
-    for (const el of document.querySelectorAll('.model-select')) {
-      const cur = el.value // keep the selection across the rebuild
-      el.innerHTML = ''
-      for (const m of models) {
-        const opt = document.createElement('option')
-        opt.value = opt.textContent = m.id
-        el.appendChild(opt)
-      }
-      setModelValue(el, cur)
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(code)
+    } else {
+      const input = document.createElement('textarea')
+      input.value = code
+      input.style.position = 'fixed'
+      input.style.opacity = '0'
+      document.body.appendChild(input)
+      input.select()
+      const copied = document.execCommand('copy')
+      input.remove()
+      if (!copied) throw new Error('copy failed')
     }
-    updateEffortOptions() // capability of the already-selected model is now known
-  } catch {} // list unavailable, the selects keep whatever the settings load put in
+    for (const el of document.querySelectorAll('.codex-copy')) el.textContent = 'Copied'
+    setTimeout(() => {
+      for (const el of document.querySelectorAll('.codex-copy')) el.textContent = 'Copy Code'
+    }, 1200)
+  } catch {
+    alert('Could not copy the code. Select it and copy it manually.')
+  }
+}
+
+async function loadCodexStatus() {
+  if (codexStatusPromise) return codexStatusPromise
+  codexStatusPromise = (async () => {
+    try {
+      const res = await fetch('/api/codex/status')
+      const status = await res.json()
+      renderCodexStatus(status)
+      return status
+    } catch (err) {
+      const status = { available: false, connected: false, error: err.message }
+      renderCodexStatus(status)
+      return status
+    }
+  })().finally(() => { codexStatusPromise = null })
+  return codexStatusPromise
+}
+
+async function connectCodex() {
+  const popup = window.open('about:blank', 'vrpg-codex-login')
+  if (!popup) {
+    alert('Allow popups for this site, then try connecting ChatGPT again.')
+    return
+  }
+  let loginId = null
+  let connected = false
+  for (const el of document.querySelectorAll('.codex-login')) el.disabled = true
+  try {
+    const login = await api('/api/codex/login', {})
+    if (!login.authUrl || !login.userCode) throw new Error('Codex did not return complete device sign-in instructions')
+    loginId = login.loginId
+    popup.location = login.authUrl
+    codexLoginPrompt = { loginId, userCode: login.userCode }
+    renderCodexStatus({ available: true, connected: false, account: null })
+    for (let i = 0; i < 90; i++) {
+      await new Promise(resolve => setTimeout(resolve, 2000))
+      const loginStatus = await (await fetch(`/api/codex/login/status?loginId=${encodeURIComponent(loginId)}`)).json()
+      if (loginStatus.done && !loginStatus.success) throw new Error(loginStatus.error || 'ChatGPT sign-in failed')
+      const status = await loadCodexStatus()
+      if (status.connected) {
+        connected = true
+        providerModels.delete('codex')
+        await loadModels('codex')
+        return
+      }
+      if (!status.available) throw new Error(status.error || 'Codex App Server became unavailable')
+      if (popup.closed) throw new Error('ChatGPT sign-in window was closed')
+    }
+    throw new Error('ChatGPT sign-in timed out')
+  } catch (err) {
+    if (popup && !popup.closed) popup.close()
+    alert(err.message)
+  } finally {
+    if (loginId && !connected) await api('/api/codex/login/cancel', { loginId }).catch(() => {})
+    codexLoginPrompt = null
+    for (const el of document.querySelectorAll('.codex-login')) el.disabled = false
+    await loadCodexStatus()
+  }
+}
+
+async function disconnectCodex() {
+  if (opBusy) return
+  setOperationBusy(true)
+  try {
+    await api('/api/codex/logout', {})
+    providerModels.delete('codex')
+  } catch (err) {
+    alert(err.message)
+  } finally {
+    setOperationBusy(false)
+    await loadCodexStatus()
+  }
+}
+
+function selectProvider(provider) {
+  const gen = ++settingsGen
+  for (const el of document.querySelectorAll('.provider-select')) el.value = provider
+  showCodexAuth(provider === 'codex')
+  const p = settingsPending.then(async () => {
+    try {
+      const models = await loadModels(provider)
+      const remembered = rememberedModels.get(provider)
+      const model = models.find(item => item.id === remembered)?.id || (models.find(item => item.default) || models[0])?.id
+      if (!model) throw new Error(`no compatible ${provider} models are available`)
+      const s = await api('/api/settings', { provider, model })
+      if (gen === settingsGen) renderSettings(s)
+      return true
+    } catch (err) {
+      alert(err.message)
+      return false
+    }
+  })
+  settingsPending = p
+  p.then(ok => { if (!ok && p === settingsPending) settingsPending = loadSettings() })
+  return p
 }
 
 let devGen = 0 // bumped to invalidate stale dev panel fetches
@@ -559,6 +738,7 @@ function startIdleLoop() {
       self.playing = false
       playGen++ // drop the loop's handlers
     }
+    if (self.handoff) self.handoff() // release a clip waiting on the loop cycle
   }
   const tick = async () => {
     try {
@@ -566,7 +746,7 @@ function startIdleLoop() {
       renderCost(state.cost) // free refresh while polling
       if (self.stopped || gen !== uiGen) return
       if (state.token !== self.token) return // the game advanced elsewhere, this loop is obsolete
-      if (state.loopFailed) return ensureStage() // no loop this turn, the frame stands
+      if (state.loopFailed) { self.stop(); return ensureStage() } // no loop this turn (or loops off), the frame stands; a re-enable restarts the poll
       if (state.loopUrl) {
         const myGen = ++playGen
         const next = standby // preload off stage, the current picture holds until the loop is decoded
@@ -794,6 +974,16 @@ async function resync(mustAdvancePast = null) {
 
 // start a new game from the character and context textboxes
 async function begin() {
+  if (opBusy) return
+  setOperationBusy(true)
+  try {
+    await beginInner()
+  } finally {
+    setOperationBusy(false)
+  }
+}
+
+async function beginInner() {
   const context = $('context').value.trim()
   const character = $('character').value.trim()
   if (!context || !character) return
@@ -843,16 +1033,21 @@ async function begin() {
 
 let opBusy = false // one turn or timeline request at a time client-side, their recovery flows must not interleave
 
+function setOperationBusy(busy) {
+  opBusy = busy
+  for (const el of document.querySelectorAll('.codex-logout')) el.disabled = busy
+}
+
 // run a turn-advancing api call with ambiguous-failure recovery, then play the resulting clip
 // restore re-renders the pre-call ui when the server provably did not advance
 // picked, when given, is the chosen option's label shown centered with the loading bar
 async function advanceTurn(label, request, restore, picked) {
   if (opBusy) return
-  opBusy = true
+  setOperationBusy(true)
   try {
     await advanceTurnInner(label, request, restore, picked)
   } finally {
-    opBusy = false
+    setOperationBusy(false)
   }
 }
 
@@ -1037,11 +1232,11 @@ function showPosition(data) {
 // jump the timeline via a seek or truncate call, recovering if the response is lost
 async function timelineJump(path, body) {
   if (opBusy) return setStatus('Another action is in progress, wait for it to finish', true)
-  opBusy = true
+  setOperationBusy(true)
   try {
     await timelineJumpInner(path, body)
   } finally {
-    opBusy = false
+    setOperationBusy(false)
   }
 }
 
@@ -1084,14 +1279,38 @@ $('sidebar-close').onclick = () => toggleSidebar(false)
 $('dev').ontoggle = () => { if ($('dev').open) loadDev(true) } // always fetch fresh prompts on open
 
 // wire both settings control sets
+for (const el of document.querySelectorAll('.provider-select')) {
+  el.onchange = () => selectProvider(el.value)
+}
 for (const el of document.querySelectorAll('.model-select')) {
-  el.onchange = () => saveSettings({ model: el.value })
+  el.onchange = () => {
+    rememberedModels.set(selectedProvider(), el.value)
+    saveSettings({ model: el.value })
+  }
 }
 for (const el of document.querySelectorAll('.effort-select')) {
   el.onchange = () => saveSettings({ effort: el.value })
 }
+for (const el of document.querySelectorAll('.loops-check')) {
+  el.onchange = async () => {
+    const on = el.checked
+    if (!await saveSettings({ loops: on })) return // save failed, the controls were restored
+    // apply on the spot: a playing loop yields to the frozen frame, re-enabling polls for a loop again
+    if (!on && loop) {
+      const playing = loop.playing
+      loop.stop() // a polling or preloading loop must not take the stage later either
+      if (playing) { video.pause(); showFrame($('frame').src) }
+      else ensureStage() // a dropped preload must not leave an empty stage
+    }
+    // only restart while idle on a frame; mid-playback the clip-end ui refresh starts it,
+    // polling now would steal the standby element from a preloading or playing clip
+    if (on && !$('game-screen').hidden && !opBusy && (video.hidden || video.paused)) startIdleLoop()
+  }
+}
+for (const el of document.querySelectorAll('.codex-login')) el.onclick = connectCodex
+for (const el of document.querySelectorAll('.codex-copy')) el.onclick = copyCodexCode
+for (const el of document.querySelectorAll('.codex-logout')) el.onclick = disconnectCodex
 settingsPending = loadSettings()
-loadModels()
 
 // rejoin an active game after a page refresh
 async function init() {

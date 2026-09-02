@@ -17,10 +17,14 @@
     <textarea id="character" rows="2" maxlength="500" placeholder="e.g. a wiry young woman with a scar over one eye, worn leather armor, red cloak"></textarea>
     <p>Describe the starting point of your story.</p>
     <textarea id="context" rows="4" maxlength="2000" placeholder="e.g. waking up in a medieval tavern with no memory, a hooded figure sitting across the table..."></textarea>
-    <!-- llm settings: openrouter model plus reasoning effort -->
+    <!-- llm settings: provider, model, and reasoning effort -->
     <p>Model</p>
     <div class="llm-settings">
-      <select class="model-select" title="openrouter model"></select>
+      <select class="provider-select" title="llm provider">
+        <option value="openrouter">OpenRouter</option>
+        <option value="codex">Codex / ChatGPT</option>
+      </select>
+      <select class="model-select" title="llm model"></select>
       <select class="effort-select" title="reasoning effort">
         <option value="default">model default</option>
         <option value="none">no reasoning</option>
@@ -30,7 +34,18 @@
         <option value="high">high reasoning</option>
         <option value="xhigh">xhigh reasoning</option>
         <option value="max">max reasoning</option>
+        <option value="ultra">ultra reasoning</option>
       </select>
+      <label class="loops-toggle" title="render 5s idle loops between turns; off shows the frozen frame instead">
+        <input type="checkbox" class="loops-check" checked> idle loops
+      </label>
+    </div>
+    <div class="codex-auth" hidden>
+      <span class="codex-auth-status">checking ChatGPT sign-in...</span>
+      <code class="codex-device-code" hidden></code>
+      <button type="button" class="codex-copy" hidden>Copy Code</button>
+      <button type="button" class="codex-login">Connect ChatGPT</button>
+      <button type="button" class="codex-logout" hidden>Disconnect</button>
     </div>
     <button id="begin">Begin</button>
 
@@ -68,7 +83,11 @@
       <div id="sidebar-bottom">
         <!-- llm settings: switching mid-game applies from the next turn -->
         <div class="llm-settings">
-          <select class="model-select" title="openrouter model"></select>
+          <select class="provider-select" title="llm provider">
+            <option value="openrouter">OpenRouter</option>
+            <option value="codex">Codex / ChatGPT</option>
+          </select>
+          <select class="model-select" title="llm model"></select>
           <select class="effort-select" title="reasoning effort">
             <option value="default">model default</option>
             <option value="none">no reasoning</option>
@@ -78,7 +97,18 @@
             <option value="high">high reasoning</option>
             <option value="xhigh">xhigh reasoning</option>
             <option value="max">max reasoning</option>
+            <option value="ultra">ultra reasoning</option>
           </select>
+          <label class="loops-toggle" title="render 5s idle loops between turns; off shows the frozen frame instead">
+            <input type="checkbox" class="loops-check" checked> idle loops
+          </label>
+        </div>
+        <div class="codex-auth" hidden>
+          <span class="codex-auth-status">checking ChatGPT sign-in...</span>
+          <code class="codex-device-code" hidden></code>
+          <button type="button" class="codex-copy" hidden>Copy Code</button>
+          <button type="button" class="codex-login">Connect ChatGPT</button>
+          <button type="button" class="codex-logout" hidden>Disconnect</button>
         </div>
         <!-- cost tracker: the active story's api spend -->
         <div id="cost" hidden>
